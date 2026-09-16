@@ -28,7 +28,7 @@ func (e *Engine) replayCommandLog() error {
 
 	entries, err := client.XRange(
 		e.ctx,
-		redis.CommandStream,
+		e.router.Stream(e.partitionID),
 		"-",
 		"+",
 	).Result()

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"predix/internal/events"
+	"predix/internal/partition"
 
 	"predix/pkg/redis"
 
@@ -61,6 +62,9 @@ type Engine struct {
 	// partitionID is this engine's partition. Phase 1 uses a single
 	// partition (0); the value is stamped on every emitted envelope.
 	partitionID int
+
+	// router owns partition routing and stream/group/sequence naming.
+	router *partition.Router
 
 	// eventSequence is a monotonically increasing counter per envelope,
 	// giving downstream consumers a stable ordering hint.
@@ -114,6 +118,7 @@ func NewEngine(rm *redis.RedisManager) (*Engine, error) {
 
 		consumerName: uuid.NewString(),
 		partitionID:  0,
+		router:       partition.NewRouter(1, "commands"),
 
 		ctx:    ctx,
 		cancel: cancel,
@@ -179,13 +184,16 @@ func (e *Engine) consumeMessages() {
 		return
 	}
 
+	stream := e.router.Stream(e.partitionID)
+	group := e.router.Group(e.partitionID)
+
 	// Reclaim pending entries left by a crashed instance within our group
 	// (MinIdle ensures we never steal work a live engine is still processing).
 	claimed, _, err := client.XAutoClaim(
 		e.ctx,
 		&rd.XAutoClaimArgs{
-			Stream:   redis.CommandStream,
-			Group:    redis.CommandGroup,
+			Stream:   stream,
+			Group:    group,
 			Consumer: e.consumerName,
 			MinIdle:  10 * time.Second,
 			Start:    "0-0",
@@ -205,9 +213,9 @@ func (e *Engine) consumeMessages() {
 		streams, err := client.XReadGroup(
 			e.ctx,
 			&rd.XReadGroupArgs{
-				Group:    redis.CommandGroup,
+				Group:    group,
 				Consumer: e.consumerName,
-				Streams:  []string{redis.CommandStream, ">"},
+				Streams:  []string{stream, ">"},
 				Count:    10,
 				Block:    0,
 			},
@@ -240,8 +248,8 @@ func (e *Engine) consumeMessages() {
 func (e *Engine) ensureCommandGroup(client *rd.Client) error {
 	err := client.XGroupCreateMkStream(
 		e.ctx,
-		redis.CommandStream,
-		redis.CommandGroup,
+		e.router.Stream(e.partitionID),
+		e.router.Group(e.partitionID),
 		"0-0",
 	).Err()
 
@@ -263,8 +271,8 @@ func (e *Engine) processStreamEntry(
 		// on restart (XAUTOCLAIM), making the command stream at-least-once.
 		if ackErr := client.XAck(
 			e.ctx,
-			redis.CommandStream,
-			redis.CommandGroup,
+			e.router.Stream(e.partitionID),
+			e.router.Group(e.partitionID),
 			entryID,
 		).Err(); ackErr != nil && !errors.Is(ackErr, context.Canceled) {
 			log.Println("XAck error:", ackErr)

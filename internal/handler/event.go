@@ -83,7 +83,7 @@ func (h *Handler) CreateEvent(c *gin.Context) {
 		Payload: payloadBytes,
 	}
 
-	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), msg)
+	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), event.ID.String(), msg)
 	if err != nil || !resp.Success {
 		// Rollback
 		h.Queries.DeleteEvent(c.Request.Context(), event.ID)

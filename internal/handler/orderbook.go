@@ -34,7 +34,7 @@ func (h *Handler) GetOrderbook(c *gin.Context) {
 		Payload: payloadBytes,
 	}
 
-	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), msg)
+	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), eventID, msg)
 	if err != nil || !resp.Success {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "orderbook not responding", "success": false})
 		return
@@ -68,7 +68,7 @@ func (h *Handler) GetOrderbookDepth(c *gin.Context) {
 		Payload: payloadBytes,
 	}
 
-	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), msg)
+	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), eventID, msg)
 	if err != nil || !resp.Success {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "orderbook not responding", "success": false})
 		return
