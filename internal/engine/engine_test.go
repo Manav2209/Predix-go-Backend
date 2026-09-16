@@ -233,7 +233,15 @@ func TestAggregateFixedPointDepth(t *testing.T) {
 		t.Errorf("first level total = %d, want %d", levels[0].Total, 5000*15)
 	}
 
+	if levels[0].OrderCount != 2 {
+		t.Errorf("first level orderCount = %d, want 2", levels[0].OrderCount)
+	}
+
 	if levels[1].Price != 6000 {
 		t.Errorf("second level price = %d, want 6000", levels[1].Price)
+	}
+
+	if levels[1].OrderCount != 1 {
+		t.Errorf("second level orderCount = %d, want 1", levels[1].OrderCount)
 	}
 }

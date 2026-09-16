@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -380,14 +379,14 @@ func (e *Engine) handleCreateOrder(
 ) *redis.EngineResponse {
 
 	var req struct {
-		OrderID   string  `json:"orderId"`
-		EventID   string  `json:"eventId"`
-		UserID    string  `json:"userId"`
-		OrderType string  `json:"orderType"`
-		Outcome   string  `json:"outcome"`
-		Side      string  `json:"side"`
-		Quantity  float64 `json:"quantity"`
-		Price     float64 `json:"price"`
+		OrderID   string `json:"orderId"`
+		EventID   string `json:"eventId"`
+		UserID    string `json:"userId"`
+		OrderType string `json:"orderType"`
+		Outcome   string `json:"outcome"`
+		Side      string `json:"side"`
+		Quantity  int64  `json:"quantity"`
+		Price     int64  `json:"price"`
 	}
 
 	if err := json.Unmarshal(payload, &req); err != nil {
@@ -400,20 +399,13 @@ func (e *Engine) handleCreateOrder(
 		orderID = uuid.NewString()
 	}
 
-	// Convert incoming floats to fixed-point inside the boundary.
-	quantity := int64(math.Floor(req.Quantity))
-
-	if math.Mod(req.Quantity, 1.0) != 0 {
-		return failure("quantity must be a whole number of shares")
-	}
+	quantity := req.Quantity
 
 	if quantity <= 0 {
 		return failure("quantity must be greater than zero")
 	}
 
-	// The handler already converted the human price to fixed-point
-	// (1/10000) units at the API boundary; do not scale again here.
-	price := int64(req.Price)
+	price := req.Price
 
 	order := &Order{
 		ID:        orderID,
@@ -994,7 +986,12 @@ func aggregateBids(
 	orders []*Order,
 ) []OrderBookEntry {
 
-	levels := make(map[int64]int64)
+	type level struct {
+		quantity int64
+		count    int64
+	}
+
+	levels := make(map[int64]*level)
 
 	for _, order := range orders {
 
@@ -1007,8 +1004,14 @@ func aggregateBids(
 			continue
 		}
 
-		levels[order.Price] +=
-			order.RemainingQuantity
+		l, ok := levels[order.Price]
+		if !ok {
+			l = &level{}
+			levels[order.Price] = l
+		}
+
+		l.quantity += order.RemainingQuantity
+		l.count++
 	}
 
 	result := make(
@@ -1017,14 +1020,15 @@ func aggregateBids(
 		len(levels),
 	)
 
-	for price, quantity := range levels {
+	for price, l := range levels {
 
 		result = append(
 			result,
 			OrderBookEntry{
-				Price:    price,
-				Quantity: quantity,
-				Total:    price * quantity,
+				Price:      price,
+				Quantity:   l.quantity,
+				Total:      price * l.quantity,
+				OrderCount: l.count,
 			},
 		)
 	}
@@ -1039,11 +1043,17 @@ func aggregateBids(
 
 	return result
 }
+
 func aggregateAsks(
 	orders []*Order,
 ) []OrderBookEntry {
 
-	levels := make(map[int64]int64)
+	type level struct {
+		quantity int64
+		count    int64
+	}
+
+	levels := make(map[int64]*level)
 
 	for _, order := range orders {
 
@@ -1056,8 +1066,14 @@ func aggregateAsks(
 			continue
 		}
 
-		levels[order.Price] +=
-			order.RemainingQuantity
+		l, ok := levels[order.Price]
+		if !ok {
+			l = &level{}
+			levels[order.Price] = l
+		}
+
+		l.quantity += order.RemainingQuantity
+		l.count++
 	}
 
 	result := make(
@@ -1066,14 +1082,15 @@ func aggregateAsks(
 		len(levels),
 	)
 
-	for price, quantity := range levels {
+	for price, l := range levels {
 
 		result = append(
 			result,
 			OrderBookEntry{
-				Price:    price,
-				Quantity: quantity,
-				Total:    price * quantity,
+				Price:      price,
+				Quantity:   l.quantity,
+				Total:      price * l.quantity,
+				OrderCount: l.count,
 			},
 		)
 	}

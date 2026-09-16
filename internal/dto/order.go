@@ -1,6 +1,7 @@
 package dto
 
 type CreateOrderRequest struct {
+	OrderID   string  `json:"orderId" binding:"omitempty"`
 	EventID   string  `json:"eventId" binding:"required"`
 	OrderType string  `json:"orderType" binding:"required,oneof=LIMIT MARKET"`
 	Outcome   string  `json:"outcome" binding:"required,oneof=YES NO"`

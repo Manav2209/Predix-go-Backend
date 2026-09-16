@@ -120,13 +120,12 @@ func (m *Market) Book(outcome string) *OrderBook {
 }
 
 type OrderBookEntry struct {
-	// Price is in fixed-point units (1/10000). Quantity is whole shares.
 	Price    int64 `json:"price"`
 	Quantity int64 `json:"quantity"`
+	Total    int64 `json:"total"`
 
-	// Total is cash in units of 1/10000 (Quantity * Price / PriceScale would be scaled,
-	// but we store value as Quantity * Price).
-	Total int64 `json:"total"`
+	// OrderCount is the number of individual resting orders at this price level.
+	OrderCount int64 `json:"orderCount"`
 }
 
 type Depth struct {

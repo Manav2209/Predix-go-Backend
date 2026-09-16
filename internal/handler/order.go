@@ -45,8 +45,13 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 		return
 	}
 
+	orderID := req.OrderID
+	if orderID == "" {
+		orderID = uuid.NewString()
+	}
+
 	payload := map[string]interface{}{
-		"orderId":   uuid.NewString(),
+		"orderId":   orderID,
 		"eventId":   req.EventID,
 		"price":     engine.ScalePrice(req.Price),
 		"quantity":  req.Quantity,

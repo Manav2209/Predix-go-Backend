@@ -30,8 +30,10 @@ func (w *WAL) Write(entry interface{}) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.file.Write(append(data, '\n'))
-	return err
+	if _, err = w.file.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return w.file.Sync()
 }
 
 func (w *WAL) Close() error {
