@@ -26,6 +26,9 @@ var (
 	ErrOrderAlreadyExists = errors.New("order already exists")
 	ErrOrderNotCancelable = errors.New("order cannot be canceled")
 	ErrInvalidOrder       = errors.New("invalid order")
+
+	ErrInsufficientFunds = errors.New("insufficient balance for order")
+	ErrInsufficientShares = errors.New("insufficient shares for order")
 )
 
 type Engine struct {
@@ -35,13 +38,16 @@ type Engine struct {
 	// - markets
 	// - orders
 	// - orderbooks
+	// - ledger (balances, positions)
 	// happens through this mutex.
 	mu sync.RWMutex
 
 	markets map[string]*Market
 	orders  map[string]*Order
 
-	pendingQueue chan *Order
+	// Ledger: the engine is the authoritative owner of user funds and shares.
+	balances  map[string]*Balance
+	positions map[string]*Position
 
 	redisManager *redis.RedisManager
 	wal          *WAL
@@ -60,16 +66,19 @@ type Engine struct {
 	// giving downstream consumers a stable ordering hint.
 	eventSequence atomic.Uint64
 
+	// replaying is true while the command log is being re-executed at
+	// startup. Emitted events are suppressed so the DB projection is not
+	// double-written.
+	replaying bool
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// consumerWG tracks the Redis stream consumer goroutine.
-	// processorWG tracks the order-matching goroutine.
-	//
-	// They are separate so Shutdown can stop the consumer first, then close
-	// the pending queue, and only then wait for the processor to drain it.
-	consumerWG  sync.WaitGroup
-	processorWG sync.WaitGroup
+	// consumerWG tracks the Redis stream consumer goroutine. Matching is
+	// synchronous inside the consumer, so no separate processor is needed.
+	consumerWG sync.WaitGroup
+
+	outbox *Outbox
 
 	startOnce sync.Once
 	stopOnce  sync.Once
@@ -85,15 +94,22 @@ func NewEngine(rm *redis.RedisManager) (*Engine, error) {
 		return nil, fmt.Errorf("create WAL: %w", err)
 	}
 
+	outbox, err := NewOutbox("data/outbox.log")
+	if err != nil {
+		return nil, fmt.Errorf("create outbox: %w", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Engine{
 		markets:      make(map[string]*Market),
 		orders:       make(map[string]*Order),
-		pendingQueue: make(chan *Order, 10000),
+		balances:     make(map[string]*Balance),
+		positions:    make(map[string]*Position),
 
 		redisManager: rm,
 		wal:          wal,
+		outbox:       outbox,
 		metrics:      NewMetrics(),
 
 		consumerName: uuid.NewString(),
@@ -106,20 +122,25 @@ func NewEngine(rm *redis.RedisManager) (*Engine, error) {
 
 func (e *Engine) Start() {
 	e.startOnce.Do(func() {
-		log.Println("Engine started. Waiting for orders...")
+		log.Println("Engine started. Replaying command log...")
+
+		if err := e.replayCommandLog(); err != nil {
+			log.Println("replay error:", err)
+		}
+
+		if e.redisManager != nil {
+			if err := e.outbox.Recover(e.ctx, e.redisManager.GetClient()); err != nil {
+				log.Println("outbox recovery error:", err)
+			}
+		}
+
+		log.Println("Engine replay complete. Waiting for orders...")
 
 		e.consumerWG.Add(1)
 
 		go func() {
 			defer e.consumerWG.Done()
 			e.consumeMessages()
-		}()
-
-		e.processorWG.Add(1)
-
-		go func() {
-			defer e.processorWG.Done()
-			e.processOrders()
 		}()
 	})
 }
@@ -128,21 +149,18 @@ func (e *Engine) Shutdown(ctx context.Context) {
 	e.stopOnce.Do(func() {
 		log.Println("Shutting down engine...")
 
-		// Stop the Redis consumer. The processor is still alive at this
-		// point and keeps draining the pending queue.
 		e.cancel()
 		e.consumerWG.Wait()
-
-		// Close only after the consumer is gone, so nothing else can write
-		// to the queue. Closing lets the processor's range loop drain the
-		// remaining buffered orders and then exit.
-		close(e.pendingQueue)
-
-		e.processorWG.Wait()
 
 		if e.wal != nil {
 			if err := e.wal.Close(); err != nil {
 				log.Println("WAL close error:", err)
+			}
+		}
+
+		if e.outbox != nil {
+			if err := e.outbox.Close(); err != nil {
+				log.Println("outbox close error:", err)
 			}
 		}
 
@@ -255,30 +273,44 @@ func (e *Engine) processStreamEntry(
 
 	clientID, _ := values["clientId"].(string)
 
-	if clientID == "" {
-		log.Println("message missing clientId")
+	rawCommand, _ := values["command"].(string)
+
+	if rawCommand == "" {
+		log.Println("message missing command envelope")
 		return
 	}
 
-	rawMessage, _ := values["message"].(string)
-
-	var msg redis.MessageToEngine
+	var env redis.CommandEnvelope
 
 	if err := json.Unmarshal(
-		[]byte(rawMessage),
-		&msg,
+		[]byte(rawCommand),
+		&env,
 	); err != nil {
-		log.Println("message unmarshal error:", err)
+		log.Println("command envelope unmarshal error:", err)
+		return
+	}
+
+	if env.Type == "" {
+		log.Println("command envelope missing type")
 		return
 	}
 
 	log.Printf(
-		"Received message type=%s clientId=%s",
-		msg.Type,
+		"Received command type=%s clientId=%s sequence=%d",
+		env.Type,
 		clientID,
+		env.Sequence,
 	)
 
-	response := e.handleMessage(msg)
+	response := e.handleMessage(redis.MessageToEngine{
+		Type:    env.Type,
+		Payload: env.Payload,
+	})
+
+	if clientID == "" {
+		// Fire-and-forget command; no reply expected.
+		return
+	}
 
 	respBytes, err := json.Marshal(response)
 	if err != nil {
@@ -304,39 +336,28 @@ func (e *Engine) handleMessage(
 
 	switch msg.Type {
 
-	case "CREATE_ORDER":
+	case string(redis.CreateOrderCommand):
 		return e.handleCreateOrder(msg.Payload)
 
-	case "CANCEL_ORDER":
+	case string(redis.CancelOrderCommand):
 		return e.handleCancelOrder(msg.Payload)
 
-	case "GET_DEPTH":
+	case string(redis.GetDepthCommand):
 		return e.handleGetDepth(msg.Payload)
 
-	case "GET_OPEN_ORDERS":
+	case string(redis.GetOpenOrdersCommand):
 		return e.handleGetOpenOrders(msg.Payload)
 
-	case "CREATE_EVENT":
+	case string(redis.CreateEventCommand):
 		return e.handleCreateEvent(msg.Payload)
+
+	case string(redis.UserCreatedCommand):
+		return e.handleUserCreated(msg.Payload)
 
 	default:
 		return &redis.EngineResponse{
 			Success: false,
 			Error:   "unknown message type",
-		}
-	}
-}
-
-func (e *Engine) processOrders() {
-	for order := range e.pendingQueue {
-		if order == nil {
-			continue
-		}
-
-		e.matchOrder(order)
-
-		if e.metrics != nil {
-			e.metrics.OrdersProcessed.Inc()
 		}
 	}
 }
@@ -448,6 +469,14 @@ func (e *Engine) handleCreateOrder(
 		return failure(ErrEventNotFound.Error())
 	}
 
+	if err := e.reserveOrderLocked(order); err != nil {
+		e.mu.Unlock()
+
+		order.Status = StatusRejected
+
+		return failure(err.Error())
+	}
+
 	e.orders[order.ID] = order
 
 	e.mu.Unlock()
@@ -455,15 +484,19 @@ func (e *Engine) handleCreateOrder(
 	// WAL must succeed before the order enters
 	// the matching queue.
 	if e.wal != nil {
-		if err := e.wal.Write(order); err != nil {
-			e.mu.Lock()
-			delete(e.orders, order.ID)
-			order.Status = StatusRejected
-			e.mu.Unlock()
+		// Replay re-applies reservations from the reconstructed ledger,
+		// so WAL writes are skipped during replay to avoid re-appending.
+		if !e.replaying {
+			if err := e.wal.Write(order); err != nil {
+				e.mu.Lock()
+				delete(e.orders, order.ID)
+				order.Status = StatusRejected
+				e.mu.Unlock()
 
-			return failure(
-				fmt.Sprintf("failed to persist order: %v", err),
-			)
+				return failure(
+					fmt.Sprintf("failed to persist order: %v", err),
+				)
+			}
 		}
 	}
 
@@ -492,18 +525,16 @@ func (e *Engine) handleCreateOrder(
 		return failure("failed to stream order creation")
 	}
 
-	// Queue order for matching.
-	select {
-	case e.pendingQueue <- order:
+	// Match synchronously so the response reflects the resulting state
+	// instead of a stale PENDING.
+	e.matchOrder(order)
 
-		return successJSON(map[string]any{
-			"orderId": order.ID,
-			"status":  StatusPending,
-		})
-
-	case <-e.ctx.Done():
-		return failure("engine shutting down")
-	}
+	return successJSON(map[string]any{
+		"orderId":          order.ID,
+		"status":           order.Status,
+		"filledQuantity":   order.FilledQuantity,
+		"remainingQuantity": order.RemainingQuantity,
+	})
 }
 
 func validateOrder(order *Order) error {
@@ -551,15 +582,15 @@ func validateOrder(order *Order) error {
 	return nil
 }
 
-func (e *Engine) matchOrder(order *Order) {
+func (e *Engine) matchOrder(order *Order) []*Trade {
 	e.mu.Lock()
 
 	// Cancellation can happen while the order is waiting
-	// in pendingQueue. Since cancellation uses the same mutex,
+	// before it processes. Since cancellation uses the same mutex,
 	// this check makes ordering deterministic.
 	if order.Status == StatusCanceled {
 		e.mu.Unlock()
-		return
+		return nil
 	}
 
 	market, exists := e.markets[order.EventID]
@@ -567,7 +598,7 @@ func (e *Engine) matchOrder(order *Order) {
 	if !exists {
 		order.Status = StatusRejected
 		e.mu.Unlock()
-		return
+		return nil
 	}
 
 	book := market.Book(order.Outcome)
@@ -575,7 +606,7 @@ func (e *Engine) matchOrder(order *Order) {
 	if book == nil {
 		order.Status = StatusRejected
 		e.mu.Unlock()
-		return
+		return nil
 	}
 
 	trades := e.matchAgainstBook(book, order)
@@ -583,12 +614,14 @@ func (e *Engine) matchOrder(order *Order) {
 	if order.RemainingQuantity == 0 {
 		order.Status = StatusFilled
 	} else if order.FilledQuantity > 0 {
-		order.Status = StatusPartial
-
-		// Remaining quantity rests on the book
-		// only for limit orders.
+		// Partially filled. The unfilled remainder rests on the book only
+		// for limit orders; a market order walks the book once and the
+		// unfilled portion is canceled.
 		if order.OrderType == OrderTypeLimit {
+			order.Status = StatusPartial
 			e.addToBook(book, order)
+		} else {
+			order.Status = StatusCanceled
 		}
 	} else {
 		// Nothing matched.
@@ -601,9 +634,31 @@ func (e *Engine) matchOrder(order *Order) {
 		}
 	}
 
+	// Apply fills to the ledger. This runs both live and during replay so
+	// the reconstructed state is identical.
+	for _, trade := range trades {
+		e.settleTradeLocked(trade)
+	}
+
+	// Orders that are no longer resting (filled or canceled) have nothing
+	// left to protect; release their over-lock.
+	if order.Status == StatusFilled || order.Status == StatusCanceled {
+		e.releaseOrderLocked(order)
+	}
+
 	e.mu.Unlock()
 
-	// Never perform Redis I/O while holding the engine lock.
+	// Never perform Redis I/O while holding the engine lock. During replay
+	// event emission is suppressed: the DB projection already contains the
+	// effects.
+	e.mu.RLock()
+	replaying := e.replaying
+	e.mu.RUnlock()
+
+	if replaying {
+		return trades
+	}
+
 	for _, trade := range trades {
 		if err := e.publishTrade(trade); err != nil {
 			log.Printf(
@@ -613,6 +668,8 @@ func (e *Engine) matchOrder(order *Order) {
 			)
 		}
 	}
+
+	return trades
 }
 
 func (e *Engine) matchAgainstBook(
@@ -624,8 +681,6 @@ func (e *Engine) matchAgainstBook(
 
 	for incoming.RemainingQuantity > 0 {
 
-		var resting *Order
-
 		if incoming.Side == SideBuy {
 
 			// Remove invalid/filled orders sitting at front.
@@ -635,7 +690,12 @@ func (e *Engine) matchAgainstBook(
 				break
 			}
 
-			resting = book.Asks[0]
+			idx := e.findCounterparty(book.Asks, incoming)
+			if idx < 0 {
+				break
+			}
+
+			e.executePair(incoming, book.Asks[idx], &book.Asks, idx, &trades)
 
 		} else {
 
@@ -645,55 +705,97 @@ func (e *Engine) matchAgainstBook(
 				break
 			}
 
-			resting = book.Bids[0]
-		}
-
-		if !canMatch(incoming, resting) {
-			break
-		}
-
-		matchQuantity := min(
-			incoming.RemainingQuantity,
-			resting.RemainingQuantity,
-		)
-
-		if matchQuantity <= 0 {
-			break
-		}
-
-		trade := buildTrade(
-			incoming,
-			resting,
-			matchQuantity,
-		)
-
-		trades = append(trades, trade)
-
-		// Update incoming.
-		incoming.RemainingQuantity -= matchQuantity
-		incoming.FilledQuantity += matchQuantity
-
-		// Update resting.
-		resting.RemainingQuantity -= matchQuantity
-		resting.FilledQuantity += matchQuantity
-
-		if resting.RemainingQuantity <= 0 {
-
-			resting.RemainingQuantity = 0
-			resting.Status = StatusFilled
-
-			if incoming.Side == SideBuy {
-				book.Asks = book.Asks[1:]
-			} else {
-				book.Bids = book.Bids[1:]
+			idx := e.findCounterparty(book.Bids, incoming)
+			if idx < 0 {
+				break
 			}
 
-		} else {
-			resting.Status = StatusPartial
+			e.executePair(incoming, book.Bids[idx], &book.Bids, idx, &trades)
 		}
 	}
 
 	return trades
+}
+
+// findCounterparty returns the index of the first resting order that can
+// trade against incoming. Same-user orders are skipped (self-trade
+// prevention policy: skip resting order) and dead orders are ignored.
+func (e *Engine) findCounterparty(
+	orders []*Order,
+	incoming *Order,
+) int {
+
+	for i, resting := range orders {
+
+		if resting.Status == StatusFilled ||
+			resting.Status == StatusCanceled ||
+			resting.Status == StatusRejected ||
+			resting.RemainingQuantity <= 0 {
+			continue
+		}
+
+		if resting.UserID == incoming.UserID {
+			continue
+		}
+
+		if canMatch(incoming, resting) {
+			return i
+		}
+	}
+
+	return -1
+}
+
+func (e *Engine) executePair(
+	incoming *Order,
+	resting *Order,
+	orders *[]*Order,
+	idx int,
+	trades *[]*Trade,
+) {
+
+	matchQuantity := min(
+		incoming.RemainingQuantity,
+		resting.RemainingQuantity,
+	)
+
+	if matchQuantity <= 0 {
+		return
+	}
+
+	trade := buildTrade(
+		incoming,
+		resting,
+		matchQuantity,
+	)
+
+	*trades = append(*trades, trade)
+
+	// Update incoming.
+	incoming.RemainingQuantity -= matchQuantity
+	incoming.FilledQuantity += matchQuantity
+
+	// Update resting.
+	resting.RemainingQuantity -= matchQuantity
+	resting.FilledQuantity += matchQuantity
+
+	if resting.RemainingQuantity <= 0 {
+		resting.RemainingQuantity = 0
+		resting.Status = StatusFilled
+		removeOrderIndex(orders, idx)
+	} else {
+		resting.Status = StatusPartial
+	}
+}
+
+// removeOrderIndex removes the element at idx from a price-time sorted slice,
+// preserving the relative order of the remaining orders.
+func removeOrderIndex(orders *[]*Order, idx int) {
+	items := *orders
+
+	copy(items[idx:], items[idx+1:])
+	items[len(items)-1] = nil
+	*orders = items[:len(items)-1]
 }
 
 func canMatch(
@@ -887,9 +989,11 @@ func (e *Engine) handleCancelOrder(
 
 	order.Status = StatusCanceled
 
+	// Frozen liquidity for the unfilled remainder is returned to the user.
+	e.releaseOrderLocked(order)
+
 	e.mu.Unlock()
 
-	// Never perform Redis I/O while holding the engine lock.
 	cancelData, _ := json.Marshal(map[string]any{
 		"orderId": order.ID,
 	})
@@ -1182,6 +1286,17 @@ func (e *Engine) emitEvent(
 	broadcast bool,
 ) error {
 
+	e.mu.RLock()
+	replaying := e.replaying
+	e.mu.RUnlock()
+
+	// During startup replay the DB projection already holds these effects;
+	// re-emitting them would double-write. This is the single gate that
+	// makes replay non-mutating minus the in-memory state.
+	if replaying {
+		return nil
+	}
+
 	if e.redisManager == nil {
 		return nil
 	}
@@ -1199,6 +1314,14 @@ func (e *Engine) emitEvent(
 	}
 
 	client := e.redisManager.GetClient()
+
+	// Append to the durable outbox first: if Redis is unreachable the
+	// envelope survives on disk and is republished after a restart.
+	if e.outbox != nil {
+		if err := e.outbox.Append(envBytes); err != nil {
+			return err
+		}
+	}
 
 	// Persistence consumer: the DB worker consumes events:out via a
 	// consumer group, so a crashed worker does not lose events.
@@ -1223,6 +1346,11 @@ func (e *Engine) emitEvent(
 		).Err(); err != nil {
 			return err
 		}
+	}
+
+	// Both targets accepted the envelope. Drop it from the journal.
+	if e.outbox != nil {
+		_ = e.outbox.Reset()
 	}
 
 	log.Printf(

@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"predix/internal/dto"
 	"predix/internal/repository"
 	"predix/pkg/auth"
+	"predix/pkg/redis"
 	"golang.org/x/crypto/bcrypt"
 	"github.com/gin-gonic/gin"
 )
@@ -35,6 +38,22 @@ func (h *Handler) Signup(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
 		return
+	}
+
+	// Grant the starting balance via the engine's durable command log. The
+	// user row is already durable, so a lost command is acceptable: the
+	// command is at-least-once, and the engine treats it idempotently.
+	if h.RedisManager != nil {
+		payload, _ := json.Marshal(map[string]string{
+			"userId": user.ID.String(),
+		})
+
+		_ = h.RedisManager.SendCommand(
+			context.Background(),
+			redis.UserCreatedCommand,
+			user.ID.String(),
+			payload,
+		)
 	}
 
 	resp := dto.SignupResponse{

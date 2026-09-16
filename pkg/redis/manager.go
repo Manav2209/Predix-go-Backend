@@ -6,12 +6,39 @@ import (
 	"errors"
 	"math/rand"
 	"time"
+
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
 type MessageToEngine struct {
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"payload"`
+}
+
+// CommandType enumerates the command verbs the engine accepts. These are the
+// durable record of every state-changing operation: the commands stream is the
+// source of truth the engine replays to reconstruct its state.
+type CommandType string
+
+const (
+	CreateOrderCommand  CommandType = "CREATE_ORDER"
+	CancelOrderCommand  CommandType = "CANCEL_ORDER"
+	GetDepthCommand     CommandType = "GET_DEPTH"
+	GetOpenOrdersCommand CommandType = "GET_OPEN_ORDERS"
+	CreateEventCommand  CommandType = "CREATE_EVENT"
+	UserCreatedCommand  CommandType = "USER_CREATED"
+)
+
+// CommandEnvelope is the durable wrapper written to the commands stream.
+// The engine re-executes these in stream order on startup.
+type CommandEnvelope struct {
+	CommandID string          `json:"commandId"`
+	Type      string          `json:"type"`
+	EventID   string          `json:"eventId,omitempty"`
+	Sequence  uint64          `json:"sequence"`
+	Timestamp time.Time       `json:"timestamp"`
+	Payload   json.RawMessage `json:"payload"`
 }
 
 // CommandStream is the Redis Stream carrying engine commands.
@@ -23,6 +50,9 @@ const CommandStream = "commands"
 
 // CommandGroup is the consumer group name shared by engine replicas.
 const CommandGroup = "engines"
+
+// CommandSequenceKey is the Redis counter backing per-command sequence numbers.
+const CommandSequenceKey = "commands:sequence"
 
 type EngineResponse struct {
 	Success bool            `json:"success"`
@@ -44,6 +74,33 @@ func NewRedisManager(addr, password string) *RedisManager {
 	return &RedisManager{
 		client:    redis.NewClient(opts),
 		publisher: redis.NewClient(opts),
+	}
+}
+
+// newCommandEnvelope stamps a durable command envelope with a unique id and a
+// monotonically increasing sequence drawn from Redis.
+func (r *RedisManager) newCommandEnvelope(
+	typ CommandType,
+	eventID string,
+	payload json.RawMessage,
+) CommandEnvelope {
+
+	seq, err := r.client.Incr(
+		context.Background(),
+		CommandSequenceKey,
+	).Uint64()
+
+	if err != nil {
+		seq = 0
+	}
+
+	return CommandEnvelope{
+		CommandID: uuid.NewString(),
+		Type:      string(typ),
+		EventID:   eventID,
+		Sequence:  seq,
+		Timestamp: time.Now().UTC(),
+		Payload:   payload,
 	}
 }
 
@@ -89,11 +146,22 @@ func (r *RedisManager) SendAndAwait(ctx context.Context, msg MessageToEngine) (*
 		return nil, err
 	}
 
+	env := r.newCommandEnvelope(
+		CommandType(msg.Type),
+		"",
+		rawMsg,
+	)
+
+	envBytes, err := json.Marshal(env)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := r.publisher.XAdd(bg, &redis.XAddArgs{
 		Stream: CommandStream,
 		Values: map[string]interface{}{
 			"clientId": clientID,
-			"message":  string(rawMsg),
+			"command":  string(envBytes),
 		},
 	}).Err(); err != nil {
 		return nil, err
@@ -107,6 +175,31 @@ func (r *RedisManager) SendAndAwait(ctx context.Context, msg MessageToEngine) (*
 	case <-time.After(5 * time.Second):
 		return nil, errors.New("timeout waiting for engine response")
 	}
+}
+
+// SendCommand writes a durable command envelope without waiting for a
+// response. Used for fire-and-forget control commands such as USER_CREATED.
+func (r *RedisManager) SendCommand(
+	ctx context.Context,
+	typ CommandType,
+	eventID string,
+	payload json.RawMessage,
+) error {
+
+	env := r.newCommandEnvelope(typ, eventID, payload)
+
+	envBytes, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+
+	return r.publisher.XAdd(ctx, &redis.XAddArgs{
+		Stream: CommandStream,
+		Values: map[string]interface{}{
+			"clientId": "",
+			"command":  string(envBytes),
+		},
+	}).Err()
 }
 
 func generateClientID() string {
