@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 )
@@ -243,5 +244,154 @@ func TestAggregateFixedPointDepth(t *testing.T) {
 
 	if levels[1].OrderCount != 1 {
 		t.Errorf("second level orderCount = %d, want 1", levels[1].OrderCount)
+	}
+}
+
+func TestHandleCreateEventIdempotent(t *testing.T) {
+	e := testEngine(t)
+
+	payload1, _ := json.Marshal(map[string]string{"eventId": "evt-1"})
+	resp1 := e.handleCreateEvent(payload1)
+	if !resp1.Success {
+		t.Fatalf("first create failed: %s", resp1.Error)
+	}
+
+	payload2, _ := json.Marshal(map[string]string{"eventId": "evt-1"})
+	resp2 := e.handleCreateEvent(payload2)
+	if !resp2.Success {
+		t.Fatalf("second create failed: %s", resp2.Error)
+	}
+
+	var result struct {
+		Status string `json:"status"`
+	}
+	json.Unmarshal(resp2.Data, &result)
+	if result.Status != "already_exists" {
+		t.Errorf("status = %s, want already_exists", result.Status)
+	}
+}
+
+func TestCancelOrder(t *testing.T) {
+	e := testEngine(t)
+
+	e.markets["evt"] = NewMarket()
+
+	order := &Order{
+		ID: "ord-1", EventID: "evt", UserID: "u1",
+		OrderType: OrderTypeLimit, Outcome: OutcomeYes, Side: SideBuy,
+		Quantity: 10, RemainingQuantity: 10,
+		Price:  5000,
+		Status: StatusPending,
+	}
+	e.orders[order.ID] = order
+	e.markets["evt"].YES.Bids = append(e.markets["evt"].YES.Bids, order)
+
+	payload, _ := json.Marshal(map[string]string{
+		"orderId": "ord-1",
+		"eventId": "evt",
+	})
+	resp := e.handleCancelOrder(payload)
+	if !resp.Success {
+		t.Fatalf("cancel failed: %s", resp.Error)
+	}
+
+	if order.Status != StatusCanceled {
+		t.Errorf("status = %s, want CANCELED", order.Status)
+	}
+
+	if len(e.markets["evt"].YES.Bids) != 0 {
+		t.Error("cancelled order should be removed from book")
+	}
+}
+
+func TestFIFOMultipleRestingAsks(t *testing.T) {
+	e := testEngine(t)
+	e.markets["evt"] = NewMarket()
+	book := e.markets["evt"].Book(OutcomeYes)
+
+	resting1 := &Order{
+		ID: "maker-1", EventID: "evt", UserID: "u1",
+		OrderType: OrderTypeLimit, Outcome: OutcomeYes, Side: SideSell,
+		Quantity: 5, RemainingQuantity: 5,
+		Price:  5000,
+		Status: StatusPending,
+	}
+	resting2 := &Order{
+		ID: "maker-2", EventID: "evt", UserID: "u2",
+		OrderType: OrderTypeLimit, Outcome: OutcomeYes, Side: SideSell,
+		Quantity: 5, RemainingQuantity: 5,
+		Price:  5000,
+		Status: StatusPending,
+	}
+
+	book.Asks = append(book.Asks, resting1, resting2)
+
+	incoming := &Order{
+		ID: "taker-1", EventID: "evt", UserID: "u3",
+		OrderType: OrderTypeLimit, Outcome: OutcomeYes, Side: SideBuy,
+		Quantity: 5, RemainingQuantity: 5,
+		Price:  6000,
+		Status: StatusPending,
+	}
+
+	e.matchOrder(incoming)
+
+	if incoming.Status != StatusFilled {
+		t.Errorf("taker status = %s, want FILLED", incoming.Status)
+	}
+
+	if resting1.Status != StatusFilled {
+		t.Errorf("first maker status = %s, want FILLED", resting1.Status)
+	}
+
+	if resting2.Status != StatusPending {
+		t.Errorf("second maker status = %s, want PENDING (untouched)", resting2.Status)
+	}
+}
+
+func TestMarketOrderNoLiquidity(t *testing.T) {
+	e := testEngine(t)
+	e.markets["evt"] = NewMarket()
+
+	incoming := &Order{
+		ID: "taker-1", EventID: "evt", UserID: "u1",
+		OrderType: OrderTypeMarket, Outcome: OutcomeYes, Side: SideBuy,
+		Quantity: 10, RemainingQuantity: 10,
+		Price:  0,
+		Status: StatusPending,
+	}
+
+	e.matchOrder(incoming)
+
+	if incoming.Status != StatusCanceled {
+		t.Errorf("market order with no liquidity: status = %s, want CANCELED", incoming.Status)
+	}
+}
+
+func TestHandleGetDepthEmptyMarket(t *testing.T) {
+	e := testEngine(t)
+	e.markets["evt"] = NewMarket()
+
+	payload, _ := json.Marshal(map[string]string{"eventId": "evt"})
+	resp := e.handleGetDepth(payload)
+	if !resp.Success {
+		t.Fatalf("get depth failed: %s", resp.Error)
+	}
+
+	var depth Depth
+	json.Unmarshal(resp.Data, &depth)
+
+	if len(depth.Yes.Bids) != 0 || len(depth.Yes.Asks) != 0 {
+		t.Error("empty market should return empty depth")
+	}
+}
+
+func TestHandleGetDepthNonExistentEvent(t *testing.T) {
+	e := testEngine(t)
+
+	payload, _ := json.Marshal(map[string]string{"eventId": "nope"})
+	resp := e.handleGetDepth(payload)
+	if resp.Success {
+		t.Error("expected failure for non-existent event")
 	}
 }
