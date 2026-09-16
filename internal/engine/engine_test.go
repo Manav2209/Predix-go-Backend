@@ -12,9 +12,10 @@ func testEngine(t *testing.T) *Engine {
 	// redisManager is left nil: emitEvent no-ops, so matching exercises
 	// the book without a live Redis.
 	return &Engine{
-		markets:      make(map[string]*Market),
-		orders:       make(map[string]*Order),
-		pendingQueue: make(chan *Order, 1),
+		markets:   make(map[string]*Market),
+		orders:    make(map[string]*Order),
+		balances:  make(map[string]*Balance),
+		positions: make(map[string]*Position),
 	}
 }
 
