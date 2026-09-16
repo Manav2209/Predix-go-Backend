@@ -171,6 +171,7 @@ func (w *Worker) handleEnvelope(
 		return w.handleOrderCanceled(ctx, envelope)
 
 	default:
+		log.Printf("unknown event type: %s", envelope.Type)
 		return nil
 	}
 }

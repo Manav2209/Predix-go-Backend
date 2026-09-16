@@ -97,10 +97,9 @@ func (s *RedisSubscriber) handle(
 
 	default:
 		log.Printf(
-			"unknown websocket event: %s",
+			"unknown websocket event type: %s",
 			envelope.Type,
 		)
-
 		return nil
 	}
 }
