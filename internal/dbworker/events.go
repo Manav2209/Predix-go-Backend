@@ -10,6 +10,7 @@ const (
 	EventOrderCreated  = events.EventOrderCreated
 	EventOrderStatus   = events.EventOrderStatus
 	EventOrderCanceled = events.EventOrderCanceled
+	EventDepthUpdated  = events.EventDepthUpdated
 )
 
 type EventEnvelope = events.EventEnvelope

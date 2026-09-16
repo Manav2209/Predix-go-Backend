@@ -90,7 +90,7 @@ func (s *RedisSubscriber) handle(
 			envelope.Data,
 		)
 
-	case "depth":
+	case events.EventDepthUpdated:
 		return s.handleDepth(
 			envelope.Data,
 		)

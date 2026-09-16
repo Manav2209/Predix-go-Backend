@@ -28,10 +28,11 @@ const WSChannel = "ws:updates"
 type EventType string
 
 const (
-	EventTradeExecuted EventType = "TRADE_EXECUTED"
-	EventOrderCreated  EventType = "ORDER_CREATED"
-	EventOrderStatus   EventType = "ORDER_STATUS"
-	EventOrderCanceled EventType = "ORDER_CANCELED"
+	EventTradeExecuted EventType = "trade_executed"
+	EventOrderCreated  EventType = "order_created"
+	EventOrderStatus   EventType = "order_status"
+	EventOrderCanceled EventType = "order_canceled"
+	EventDepthUpdated  EventType = "depth_updated"
 )
 
 // EventEnvelope wraps every domain event.

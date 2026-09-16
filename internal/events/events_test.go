@@ -18,7 +18,7 @@ func TestNewEnvelopeRoundTrip(t *testing.T) {
 	}
 
 	if env.Type != EventTradeExecuted {
-		t.Errorf("type = %s, want TRADE_EXECUTED", env.Type)
+		t.Errorf("type = %s, want trade_executed", env.Type)
 	}
 
 	if env.PartitionID != 0 {
@@ -62,10 +62,11 @@ func TestNewEnvelopeRoundTrip(t *testing.T) {
 
 func TestEventTypeConstants(t *testing.T) {
 	cases := map[EventType]string{
-		EventTradeExecuted: "TRADE_EXECUTED",
-		EventOrderCreated:  "ORDER_CREATED",
-		EventOrderStatus:   "ORDER_STATUS",
-		EventOrderCanceled: "ORDER_CANCELED",
+		EventTradeExecuted: "trade_executed",
+		EventOrderCreated:  "order_created",
+		EventOrderStatus:   "order_status",
+		EventOrderCanceled: "order_canceled",
+		EventDepthUpdated:  "depth_updated",
 	}
 
 	for typ, want := range cases {
