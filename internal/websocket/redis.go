@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"log"
 
+	"predix/internal/engine"
+	"predix/internal/events"
+
 	"github.com/redis/go-redis/v9"
 )
 
@@ -30,7 +33,7 @@ func (s *RedisSubscriber) Run(
 
 	pubsub := s.client.Subscribe(
 		ctx,
-		"ws:updates",
+		events.WSChannel,
 	)
 
 	defer pubsub.Close()
@@ -71,10 +74,7 @@ func (s *RedisSubscriber) handle(
 	message []byte,
 ) error {
 
-	var envelope struct {
-		Type string          `json:"type"`
-		Data json.RawMessage `json:"data"`
-	}
+	var envelope events.EventEnvelope
 
 	if err := json.Unmarshal(
 		message,
@@ -85,22 +85,21 @@ func (s *RedisSubscriber) handle(
 
 	switch envelope.Type {
 
-	case "trade":
+	case events.EventTradeExecuted:
 		return s.handleTrade(
 			envelope.Data,
 		)
 
-	case "depth":
+	case events.EventDepthUpdated:
 		return s.handleDepth(
 			envelope.Data,
 		)
 
 	default:
 		log.Printf(
-			"unknown websocket event: %s",
+			"unknown websocket event type: %s",
 			envelope.Type,
 		)
-
 		return nil
 	}
 }
@@ -109,7 +108,7 @@ func (s *RedisSubscriber) handleTrade(
 	data []byte,
 ) error {
 
-	var trade TradeData
+	var trade engine.Trade
 
 	if err := json.Unmarshal(
 		data,
@@ -118,9 +117,26 @@ func (s *RedisSubscriber) handleTrade(
 		return err
 	}
 
+	// The actor is the taker that initiated the trade.
+	actorID := trade.SellerID
+
+	if trade.TakerSide == engine.SideBuy {
+		actorID = trade.BuyerID
+	}
+
+	tradeData := TradeData{
+		Price:     trade.Price,
+		Quantity:  trade.Quantity,
+		Timestamp: trade.CreatedAt.UnixMilli(),
+		EventID:   trade.EventID,
+		UserID:    actorID,
+		Outcome:   trade.Outcome,
+		Side:      trade.TakerSide,
+	}
+
 	message := TradeMessage{
 		Type: "trade",
-		Data: trade,
+		Data: tradeData,
 	}
 
 	payload, err := json.Marshal(message)

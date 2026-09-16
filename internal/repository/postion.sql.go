@@ -83,7 +83,14 @@ VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (user_id, event_id, outcome)
 DO UPDATE SET
     shares = positions.shares + EXCLUDED.shares,
-    avg_price = EXCLUDED.avg_price,
+    avg_price = CASE
+        WHEN positions.shares + EXCLUDED.shares = 0
+        THEN EXCLUDED.avg_price
+        ELSE (
+            (positions.avg_price * positions.shares) +
+            (EXCLUDED.avg_price * EXCLUDED.shares)
+        ) / NULLIF(positions.shares + EXCLUDED.shares, 0)
+    END,
     updated_at = NOW()
 `
 

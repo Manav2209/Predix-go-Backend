@@ -12,51 +12,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createOrder = `-- name: CreateOrder :one
-INSERT INTO orders (id, event_id, user_id, order_type, outcome, side, quantity, price, status)
-VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, 'PENDING')
-RETURNING id, event_id, user_id, order_type, outcome, side, quantity, price, status, created_at, updated_at
-`
-
-type CreateOrderParams struct {
-	EventID   uuid.UUID
-	UserID    uuid.UUID
-	OrderType string
-	Outcome   string
-	Side      string
-	Quantity  pgtype.Numeric
-	Price     pgtype.Numeric
-}
-
-func (q *Queries) CreateOrder(ctx context.Context, arg CreateOrderParams) (Order, error) {
-	row := q.db.QueryRow(ctx, createOrder,
-		arg.EventID,
-		arg.UserID,
-		arg.OrderType,
-		arg.Outcome,
-		arg.Side,
-		arg.Quantity,
-		arg.Price,
-	)
-	var i Order
-	err := row.Scan(
-		&i.ID,
-		&i.EventID,
-		&i.UserID,
-		&i.OrderType,
-		&i.Outcome,
-		&i.Side,
-		&i.Quantity,
-		&i.Price,
-		&i.Status,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
-}
-
 const getOrdersByUserAndEvent = `-- name: GetOrdersByUserAndEvent :many
-SELECT id, event_id, user_id, order_type, outcome, side, quantity, price, status, created_at, updated_at
+SELECT id, event_id, user_id, order_type, outcome, side, quantity, price, status, filled_quantity, remaining_quantity, created_at, updated_at
 FROM orders
 WHERE user_id = $1 AND event_id = $2
 `
@@ -66,15 +23,31 @@ type GetOrdersByUserAndEventParams struct {
 	EventID uuid.UUID
 }
 
-func (q *Queries) GetOrdersByUserAndEvent(ctx context.Context, arg GetOrdersByUserAndEventParams) ([]Order, error) {
+type GetOrdersByUserAndEventRow struct {
+	ID                uuid.UUID
+	EventID           uuid.UUID
+	UserID            uuid.UUID
+	OrderType         string
+	Outcome           string
+	Side              string
+	Quantity          pgtype.Numeric
+	Price             pgtype.Numeric
+	Status            string
+	FilledQuantity    pgtype.Numeric
+	RemainingQuantity pgtype.Numeric
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+}
+
+func (q *Queries) GetOrdersByUserAndEvent(ctx context.Context, arg GetOrdersByUserAndEventParams) ([]GetOrdersByUserAndEventRow, error) {
 	rows, err := q.db.Query(ctx, getOrdersByUserAndEvent, arg.UserID, arg.EventID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Order
+	var items []GetOrdersByUserAndEventRow
 	for rows.Next() {
-		var i Order
+		var i GetOrdersByUserAndEventRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.EventID,
@@ -85,6 +58,8 @@ func (q *Queries) GetOrdersByUserAndEvent(ctx context.Context, arg GetOrdersByUs
 			&i.Quantity,
 			&i.Price,
 			&i.Status,
+			&i.FilledQuantity,
+			&i.RemainingQuantity,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -98,21 +73,74 @@ func (q *Queries) GetOrdersByUserAndEvent(ctx context.Context, arg GetOrdersByUs
 	return items, nil
 }
 
+const insertOrder = `-- name: InsertOrder :exec
+INSERT INTO orders (
+    id,
+    event_id,
+    user_id,
+    order_type,
+    outcome,
+    side,
+    quantity,
+    price,
+    status,
+    filled_quantity,
+    remaining_quantity
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+)
+`
+
+type InsertOrderParams struct {
+	ID                uuid.UUID
+	EventID           uuid.UUID
+	UserID            uuid.UUID
+	OrderType         string
+	Outcome           string
+	Side              string
+	Quantity          pgtype.Numeric
+	Price             pgtype.Numeric
+	Status            string
+	FilledQuantity    pgtype.Numeric
+	RemainingQuantity pgtype.Numeric
+}
+
+func (q *Queries) InsertOrder(ctx context.Context, arg InsertOrderParams) error {
+	_, err := q.db.Exec(ctx, insertOrder,
+		arg.ID,
+		arg.EventID,
+		arg.UserID,
+		arg.OrderType,
+		arg.Outcome,
+		arg.Side,
+		arg.Quantity,
+		arg.Price,
+		arg.Status,
+		arg.FilledQuantity,
+		arg.RemainingQuantity,
+	)
+	return err
+}
+
 const updateOrderFill = `-- name: UpdateOrderFill :exec
 UPDATE orders
 SET
-    status = $2,
+    filled_quantity = filled_quantity + $2,
+    remaining_quantity = GREATEST(quantity - (filled_quantity + $2), 0),
+    status = $3,
     updated_at = NOW()
 WHERE id = $1
 `
 
 type UpdateOrderFillParams struct {
-	ID     uuid.UUID
-	Status string
+	ID             uuid.UUID
+	FilledQuantity pgtype.Numeric
+	Status         string
 }
 
 func (q *Queries) UpdateOrderFill(ctx context.Context, arg UpdateOrderFillParams) error {
-	_, err := q.db.Exec(ctx, updateOrderFill, arg.ID, arg.Status)
+	_, err := q.db.Exec(ctx, updateOrderFill, arg.ID, arg.FilledQuantity, arg.Status)
 	return err
 }
 

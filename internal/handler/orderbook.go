@@ -12,12 +12,6 @@ import (
 func (h *Handler) GetOrderbook(c *gin.Context) {
 	eventID := c.Param("eventId")
 
-	userID, exists := c.Get("userID")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized", "success": false})
-		return
-	}
-
 	eid, err := uuid.Parse(eventID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid event ID", "success": false})
@@ -32,12 +26,11 @@ func (h *Handler) GetOrderbook(c *gin.Context) {
 
 	payload := map[string]interface{}{
 		"eventId": eventID,
-		"userId":  userID,
 	}
 	payloadBytes, _ := json.Marshal(payload)
 
 	msg := redis.MessageToEngine{
-		Type:    "GET_OPEN_ORDERS",
+		Type:    "GET_DEPTH",
 		Payload: payloadBytes,
 	}
 

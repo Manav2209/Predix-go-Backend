@@ -42,6 +42,7 @@ func main() {
 
 	worker := dbworker.New(
 		redisManager.GetClient(),
+		db,
 		queries,
 	)
 

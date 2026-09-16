@@ -60,6 +60,7 @@ func (q *Queries) GetTradesByEvent(ctx context.Context, arg GetTradesByEventPara
 
 const insertTrade = `-- name: InsertTrade :one
 INSERT INTO trades (
+    id,
     event_id,
     outcome,
     taker_order_id,
@@ -71,12 +72,13 @@ INSERT INTO trades (
     price
 )
 VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
 )
 RETURNING id, event_id, outcome, taker_order_id, maker_order_id, buyer_id, seller_id, taker_side, quantity, price, created_at
 `
 
 type InsertTradeParams struct {
+	ID           uuid.UUID
 	EventID      uuid.UUID
 	Outcome      string
 	TakerOrderID uuid.UUID
@@ -90,6 +92,7 @@ type InsertTradeParams struct {
 
 func (q *Queries) InsertTrade(ctx context.Context, arg InsertTradeParams) (Trade, error) {
 	row := q.db.QueryRow(ctx, insertTrade,
+		arg.ID,
 		arg.EventID,
 		arg.Outcome,
 		arg.TakerOrderID,

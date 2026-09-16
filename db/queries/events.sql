@@ -17,7 +17,12 @@ RETURNING id, title, description, question, thumbnail, is_active, expires_at, cr
 -- name: DeleteEvent :exec
 DELETE FROM events WHERE id = $1;
 
+-- name: IncrementEventVolume :exec
+UPDATE events
+SET volume = volume + $2, updated_at = NOW()
+WHERE id = $1;
+
 -- name: GetOrderByID :one
-SELECT id, event_id, user_id, order_type, outcome, side, quantity, price, status, created_at, updated_at
+SELECT id, event_id, user_id, order_type, outcome, side, quantity, price, status, filled_quantity, remaining_quantity, created_at, updated_at
 FROM orders
 WHERE id = $1;

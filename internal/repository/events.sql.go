@@ -26,7 +26,19 @@ type CreateEventParams struct {
 	ExpiresAt   pgtype.Timestamptz
 }
 
-func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error) {
+type CreateEventRow struct {
+	ID          uuid.UUID
+	Title       string
+	Description string
+	Question    string
+	Thumbnail   string
+	IsActive    pgtype.Bool
+	ExpiresAt   pgtype.Timestamptz
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (CreateEventRow, error) {
 	row := q.db.QueryRow(ctx, createEvent,
 		arg.Title,
 		arg.Description,
@@ -34,7 +46,7 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 		arg.Thumbnail,
 		arg.ExpiresAt,
 	)
-	var i Event
+	var i CreateEventRow
 	err := row.Scan(
 		&i.ID,
 		&i.Title,
@@ -65,15 +77,27 @@ WHERE is_active = true
 ORDER BY expires_at ASC
 `
 
-func (q *Queries) GetActiveEvents(ctx context.Context) ([]Event, error) {
+type GetActiveEventsRow struct {
+	ID          uuid.UUID
+	Title       string
+	Description string
+	Question    string
+	Thumbnail   string
+	IsActive    pgtype.Bool
+	ExpiresAt   pgtype.Timestamptz
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+func (q *Queries) GetActiveEvents(ctx context.Context) ([]GetActiveEventsRow, error) {
 	rows, err := q.db.Query(ctx, getActiveEvents)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Event
+	var items []GetActiveEventsRow
 	for rows.Next() {
-		var i Event
+		var i GetActiveEventsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Title,
@@ -101,9 +125,21 @@ FROM events
 WHERE id = $1
 `
 
-func (q *Queries) GetEventByID(ctx context.Context, id uuid.UUID) (Event, error) {
+type GetEventByIDRow struct {
+	ID          uuid.UUID
+	Title       string
+	Description string
+	Question    string
+	Thumbnail   string
+	IsActive    pgtype.Bool
+	ExpiresAt   pgtype.Timestamptz
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+func (q *Queries) GetEventByID(ctx context.Context, id uuid.UUID) (GetEventByIDRow, error) {
 	row := q.db.QueryRow(ctx, getEventByID, id)
-	var i Event
+	var i GetEventByIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.Title,
@@ -119,14 +155,30 @@ func (q *Queries) GetEventByID(ctx context.Context, id uuid.UUID) (Event, error)
 }
 
 const getOrderByID = `-- name: GetOrderByID :one
-SELECT id, event_id, user_id, order_type, outcome, side, quantity, price, status, created_at, updated_at
+SELECT id, event_id, user_id, order_type, outcome, side, quantity, price, status, filled_quantity, remaining_quantity, created_at, updated_at
 FROM orders
 WHERE id = $1
 `
 
-func (q *Queries) GetOrderByID(ctx context.Context, id uuid.UUID) (Order, error) {
+type GetOrderByIDRow struct {
+	ID                uuid.UUID
+	EventID           uuid.UUID
+	UserID            uuid.UUID
+	OrderType         string
+	Outcome           string
+	Side              string
+	Quantity          pgtype.Numeric
+	Price             pgtype.Numeric
+	Status            string
+	FilledQuantity    pgtype.Numeric
+	RemainingQuantity pgtype.Numeric
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+}
+
+func (q *Queries) GetOrderByID(ctx context.Context, id uuid.UUID) (GetOrderByIDRow, error) {
 	row := q.db.QueryRow(ctx, getOrderByID, id)
-	var i Order
+	var i GetOrderByIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.EventID,
@@ -137,8 +189,26 @@ func (q *Queries) GetOrderByID(ctx context.Context, id uuid.UUID) (Order, error)
 		&i.Quantity,
 		&i.Price,
 		&i.Status,
+		&i.FilledQuantity,
+		&i.RemainingQuantity,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const incrementEventVolume = `-- name: IncrementEventVolume :exec
+UPDATE events
+SET volume = volume + $2, updated_at = NOW()
+WHERE id = $1
+`
+
+type IncrementEventVolumeParams struct {
+	ID     uuid.UUID
+	Volume pgtype.Numeric
+}
+
+func (q *Queries) IncrementEventVolume(ctx context.Context, arg IncrementEventVolumeParams) error {
+	_, err := q.db.Exec(ctx, incrementEventVolume, arg.ID, arg.Volume)
+	return err
 }

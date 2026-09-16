@@ -16,8 +16,8 @@ type OutgoingMessage struct {
 }
 
 type TradeData struct {
-	Price     string `json:"price"`
-	Quantity  string `json:"quantity"`
+	Price     int64  `json:"price"`
+	Quantity  int64  `json:"quantity"`
 	Timestamp int64  `json:"timestamp"`
 	EventID   string `json:"eventId"`
 	UserID    string `json:"userId"`
@@ -31,9 +31,9 @@ type TradeMessage struct {
 }
 
 type DepthEntry struct {
-	Price    float64 `json:"price"`
-	Quantity float64 `json:"quantity"`
-	Total    float64 `json:"total"`
+	Price    int64 `json:"price"`
+	Quantity int64 `json:"quantity"`
+	Total    int64 `json:"total"`
 }
 
 type DepthData struct {

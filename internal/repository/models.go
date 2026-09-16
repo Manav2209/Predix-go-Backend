@@ -21,20 +21,23 @@ type Event struct {
 	ExpiresAt   pgtype.Timestamptz
 	CreatedAt   pgtype.Timestamptz
 	UpdatedAt   pgtype.Timestamptz
+	Volume      pgtype.Numeric
 }
 
 type Order struct {
-	ID        uuid.UUID
-	EventID   uuid.UUID
-	UserID    uuid.UUID
-	OrderType string
-	Outcome   string
-	Side      string
-	Quantity  pgtype.Numeric
-	Price     pgtype.Numeric
-	Status    string
-	CreatedAt pgtype.Timestamptz
-	UpdatedAt pgtype.Timestamptz
+	ID                uuid.UUID
+	EventID           uuid.UUID
+	UserID            uuid.UUID
+	OrderType         string
+	Outcome           string
+	Side              string
+	Quantity          pgtype.Numeric
+	Price             pgtype.Numeric
+	Status            string
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+	FilledQuantity    pgtype.Numeric
+	RemainingQuantity pgtype.Numeric
 }
 
 type Position struct {
