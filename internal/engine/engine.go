@@ -129,6 +129,11 @@ func NewEngine(rm *redis.RedisManager) (*Engine, error) {
 	return newEngine(rm, "data/outbox.log")
 }
 
+// NewEngineWithOutbox is NewEngine with an explicit durable outbox path.
+func NewEngineWithOutbox(rm *redis.RedisManager, outboxPath string) (*Engine, error) {
+	return newEngine(rm, outboxPath)
+}
+
 // newEngine is NewEngine with an explicit outbox path (tests use a temp dir).
 func newEngine(rm *redis.RedisManager, outboxPath string) (*Engine, error) {
 	if rm == nil {
