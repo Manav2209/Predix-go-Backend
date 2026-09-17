@@ -723,3 +723,161 @@ func partitionToken(t *testing.T, e *Engine, pid int) uint64 {
 	defer e.mu.RUnlock()
 	return e.partitionToken[pid]
 }
+
+// TestEngineFailoverReconstructsState verifies P2.7: after killing the owner,
+// the successor rebuilds the full ledger + orderbook from the partition
+// command stream under a newer fencing token.
+func TestEngineFailoverReconstructsState(t *testing.T) {
+	srv, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	rm1 := rpkg.NewRedisManager(srv.Addr(), "")
+	defer rm1.Close()
+
+	eng1, err := newEngine(rm1, filepath.Join(t.TempDir(), "outbox1.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := partition.NewRouter(2, "commands")
+
+	eng1.SetRouter(r)
+	rm1.SetRouter(r)
+	eng1.SetLeaseSettings("engine-1", 1*time.Second, 250*time.Millisecond)
+
+	for pid := 0; pid < r.Partitions; pid++ {
+		if err := eng1.AddPartition(pid); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	eng1.Start()
+
+	waitFor(t, 5*time.Second, func() bool {
+		eng1.mu.RLock()
+		defer eng1.mu.RUnlock()
+		return eng1.partitionToken[0] > 0 && eng1.partitionToken[1] > 0
+	})
+
+	userID := "user-1"
+	eventID := "evt-1"
+	orderID := "ord-1"
+
+	if err := rm1.SendCommandFanout(ctx, rpkg.UserCreatedCommand,
+		mustJSONTest(t, map[string]any{"userId": userID})); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rm1.SendCommand(ctx, eventID, rpkg.CreateEventCommand,
+		mustJSONTest(t, map[string]any{"eventId": eventID})); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rm1.SendAndAwait(ctx, eventID, rpkg.MessageToEngine{
+		Type: string(rpkg.CreateOrderCommand),
+		Payload: mustJSONTest(t, map[string]any{
+			"orderId":   orderID,
+			"eventId":   eventID,
+			"userId":    userID,
+			"orderType": "LIMIT",
+			"outcome":   "YES",
+			"side":      "BUY",
+			"quantity":  100,
+			"price":     5000,
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Success {
+		t.Fatalf("create order rejected: %s", resp.Error)
+	}
+
+	pid := r.Partition(eventID)
+	token1 := partitionToken(t, eng1, pid)
+
+	avail1, reserved1, ok := eng1.GetBalances(userID)
+	if !ok {
+		t.Fatal("user balance missing on engine-1")
+	}
+
+	var wantAvail int64 = DefaultStartingBalance - 100*5000
+	var wantReserved int64 = 100 * 5000
+
+	if avail1 != wantAvail || reserved1 != wantReserved {
+		t.Errorf("engine-1 balance = (%d, %d), want (%d, %d)",
+			avail1, reserved1, wantAvail, wantReserved)
+	}
+
+	// Kill engine-1; engine-2 takes over and must rebuild state.
+	eng1.Shutdown(ctx)
+
+	rm2 := rpkg.NewRedisManager(srv.Addr(), "")
+	defer rm2.Close()
+
+	eng2 := newTestEngine(t, rm2)
+	eng2.SetRouter(r)
+	rm2.SetRouter(r)
+	eng2.SetLeaseSettings("engine-2", 1*time.Second, 250*time.Millisecond)
+
+	for pidX := 0; pidX < r.Partitions; pidX++ {
+		if err := eng2.AddPartition(pidX); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	eng2.Start()
+	defer eng2.Shutdown(ctx)
+
+	waitFor(t, 5*time.Second, func() bool {
+		return partitionToken(t, eng2, pid) > 0
+	})
+
+	// Successor replays the command stream and reconstructs the order.
+	order2 := getOrderCopy(t, eng2, orderID)
+	if order2.EventID != eventID || order2.UserID != userID {
+		t.Errorf("reconstructed order mismatch: %+v", order2)
+	}
+
+	avail2, reserved2, ok := eng2.GetBalances(userID)
+	if !ok {
+		t.Fatal("user balance missing after failover")
+	}
+
+	if avail2 != wantAvail || reserved2 != wantReserved {
+		t.Errorf("engine-2 balance = (%d, %d), want (%d, %d)",
+			avail2, reserved2, wantAvail, wantReserved)
+	}
+
+	token2 := partitionToken(t, eng2, pid)
+	if token2 <= token1 {
+		t.Errorf("successor fencing token %d not newer than %d", token2, token1)
+	}
+}
+
+func getOrderCopy(t *testing.T, e *Engine, id string) *Order {
+	t.Helper()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	order, ok := e.orders[id]
+	if !ok {
+		t.Fatalf("order %s not found", id)
+	}
+	copyOrder := *order
+	return &copyOrder
+}
+
+func mustJSONTest(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	return b
+}
