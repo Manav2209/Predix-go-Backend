@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,6 +14,7 @@ import (
 	"predix/internal/observability"
 	"predix/internal/partition"
 	"predix/pkg/config"
+	"predix/pkg/logging"
 	"predix/pkg/redis"
 )
 
@@ -42,6 +44,8 @@ func main() {
 	)
 
 	eng.SetStreamNames(cfg.DBStream, cfg.WSStream)
+
+	eng.SetLogger(logging.New(cfg.EngineID, slog.LevelInfo, os.Stdout))
 
 	for pid := 0; pid < cfg.PartitionCount; pid++ {
 		if err := eng.AddPartition(pid); err != nil {

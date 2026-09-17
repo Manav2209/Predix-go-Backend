@@ -116,6 +116,11 @@ func (e *Engine) runPartition(partitionID int, _ *partitionWorker) {
 			token,
 		)
 
+		e.logEvent("partition_lease_acquired",
+			"partitionId", partitionID,
+			"fencingToken", token,
+		)
+
 		// partition ctx is canceled when the lease is lost so the consumer
 		// stops reading; the outer loop then competes for the lease again.
 		pctx, pcancel := context.WithCancel(e.ctx)
@@ -196,6 +201,10 @@ func (e *Engine) renewLease(
 					e.engineID,
 					fmt.Sprintf("%d", partitionID),
 				).Inc()
+
+				e.logEvent("partition_failover",
+					"partitionId", partitionID,
+				)
 
 				pcancel()
 				return

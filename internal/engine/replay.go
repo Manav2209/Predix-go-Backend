@@ -48,6 +48,8 @@ func (e *Engine) replayCommandLog(partitionID int) error {
 		e.mu.Unlock()
 	}()
 
+	e.logEvent("event_replay_start", "partitionId", partitionID)
+
 	start := time.Now()
 
 	for _, msg := range entries {
@@ -69,6 +71,14 @@ func (e *Engine) replayCommandLog(partitionID int) error {
 	}
 
 	e.metrics.ReplayLatency.Observe(time.Since(start).Seconds())
+
+	elapsed := time.Since(start)
+
+	e.logEvent("event_replay_complete",
+		"partitionId", partitionID,
+		"commands", len(entries),
+		"elapsedMs", elapsed.Milliseconds(),
+	)
 
 	log.Printf(
 		"replayed %d command(s) from stream (partition %d)",

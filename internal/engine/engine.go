@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,6 +18,7 @@ import (
 	"predix/internal/events"
 	"predix/internal/partition"
 
+	"predix/pkg/logging"
 	"predix/pkg/redis"
 
 	"github.com/google/uuid"
@@ -108,6 +110,10 @@ type Engine struct {
 
 	outbox *Outbox
 
+	// logger emits JSON-structured records (P3.3); every record carries
+	// instanceId = engineID.
+	logger *logging.Logger
+
 	startOnce sync.Once
 	stopOnce  sync.Once
 }
@@ -152,6 +158,7 @@ func newEngine(rm *redis.RedisManager, outboxPath string) (*Engine, error) {
 
 		consumerName: uuid.NewString(),
 		engineID:     "engine-0",
+		logger:       logging.New("", slog.LevelInfo, nil),
 
 		leaseTTL:           defaultLeaseTTL,
 		leaseRenewInterval: defaultLeaseRenewInterval,
@@ -172,6 +179,8 @@ func newEngine(rm *redis.RedisManager, outboxPath string) (*Engine, error) {
 
 // SetStreamNames overrides the durable event stream and the WebSocket fan-out
 // channel this engine publishes to (P3.7). Empty values keep the defaults.
+// SetStreamNames configures the durable event stream and WS fan-out channel
+// names (P3.7). Empty values leave the current names untouched.
 func (e *Engine) SetStreamNames(eventStream, wsChannel string) {
 	e.emitMu.Lock()
 	defer e.emitMu.Unlock()
@@ -182,6 +191,19 @@ func (e *Engine) SetStreamNames(eventStream, wsChannel string) {
 	if wsChannel != "" {
 		e.wsChannel = wsChannel
 	}
+}
+
+// SetLogger installs a structured logger (P3.3). It must be called before
+// Start; if omitted the engine uses a stdout JSON logger.
+func (e *Engine) SetLogger(l *logging.Logger) {
+	if l == nil {
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.logger = l
 }
 
 // SetRouter installs the partition router this engine uses for stream, group
@@ -208,6 +230,7 @@ func (e *Engine) SetLeaseSettings(engineID string, ttl, renew time.Duration) {
 
 	if engineID != "" {
 		e.engineID = engineID
+		e.logger = e.logger.With("instanceId", engineID)
 	}
 
 	if ttl > 0 {
@@ -282,6 +305,20 @@ func (e *Engine) OwnedPartitions() int {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return len(e.partitionToken)
+}
+
+// logEvent emits a structured JSON record (P3.3). Attributes commonly
+// include requestId, commandId, orderId, eventId, partitionId, sequence;
+// instanceId is a base attribute of the logger.
+func (e *Engine) logEvent(event string, attrs ...any) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.logger == nil {
+		return
+	}
+
+	e.logger.Info(event, attrs...)
 }
 
 // MetricsRegistry exposes the engine's Prometheus registry (P3.4).
@@ -434,6 +471,16 @@ func (e *Engine) processStreamEntry(
 		Payload: env.Payload,
 	})
 
+	e.logEvent("command_handled",
+		"type", env.Type,
+		"requestId", env.RequestID,
+		"commandId", env.CommandID,
+		"eventId", env.EventID,
+		"partitionId", partitionID,
+		"sequence", env.Sequence,
+		"success", response != nil && response.Success,
+	)
+
 	if clientID == "" {
 		// Fire-and-forget command; no reply expected.
 		return
@@ -555,6 +602,27 @@ func (e *Engine) handleCreateOrderP(
 		} else {
 			e.metrics.OrdersRejected.Inc()
 		}
+	}
+
+	var meta struct {
+		OrderID string `json:"orderId"`
+		EventID string `json:"eventId"`
+	}
+	_ = json.Unmarshal(payload, &meta)
+
+	if resp.Success {
+		e.logEvent("order_accepted",
+			"orderId", meta.OrderID,
+			"eventId", meta.EventID,
+			"partitionId", partitionID,
+		)
+	} else {
+		e.logEvent("order_rejected",
+			"orderId", meta.OrderID,
+			"eventId", meta.EventID,
+			"partitionId", partitionID,
+			"reason", resp.Error,
+		)
 	}
 
 	return resp
@@ -817,10 +885,26 @@ func (e *Engine) matchOrder(order *Order, partitionID int) []*Trade {
 
 	if order.Status == StatusFilled {
 		e.metrics.OrdersFilled.Inc()
+
+		e.logEvent("order_filled",
+			"orderId", order.ID,
+			"eventId", order.EventID,
+			"partitionId", partitionID,
+		)
 	}
 
 	for _, trade := range trades {
 		e.metrics.TradesExecuted.Inc()
+
+		e.logEvent("trade_executed",
+			"tradeId", trade.ID,
+			"eventId", trade.EventID,
+			"orderId", trade.OrderID,
+			"matchOrderId", trade.MatchOrderID,
+			"partitionId", partitionID,
+			"quantity", trade.Quantity,
+			"price", trade.Price,
+		)
 
 		if err := e.publishTrade(partitionID, trade); err != nil {
 			log.Printf(
@@ -1166,6 +1250,12 @@ func (e *Engine) handleCancelOrderP(
 	if !e.isReplaying(partitionID) {
 		e.metrics.OrdersCanceled.Inc()
 	}
+
+	e.logEvent("order_canceled",
+		"orderId", order.ID,
+		"eventId", order.EventID,
+		"partitionId", partitionID,
+	)
 
 	cancelData, _ := json.Marshal(map[string]any{
 		"orderId": order.ID,
