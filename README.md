@@ -141,6 +141,7 @@ before upgrading and broadcasts `events.EventEnvelope` payloads (e.g.
   lose commands.
 - **Shutdown**: every service drains in-flight work with a deadline.
 - **Metrics**: `engine_orders_accepted_total`, `engine_trades_executed_total`,
+  `engine_settlement_failures_total`, `engine_redis_latency_seconds`,
   `engine_matching_latency_seconds`, `engine_replay_latency_seconds`,
   `engine_partition_owner`, `engine_lease_losses_total`, and more.
 - **Logging**: JSON structured logs carrying `requestId`, `commandId`,

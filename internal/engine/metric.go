@@ -16,9 +16,17 @@ type Metrics struct {
 	OrdersFilled   prometheus.Counter
 	TradesExecuted prometheus.Counter
 
+	// SettlementFailures counts trade_executed envelopes the engine failed to
+	// persist to the event stream (P3.4 /settlement/failures).
+	SettlementFailures prometheus.Counter
+
 	// P3.4 — latency observations.
 	MatchingLatency prometheus.Histogram
 	ReplayLatency   prometheus.Histogram
+
+	// RedisLatency observes the engine's production-path Redis writes
+	// (XAdd to the event stream, Publish to the WS channel).
+	RedisLatency prometheus.Histogram
 
 	// AcquiredPartitions is 1 while this engine owns the partition (P2.3).
 	AcquiredPartitions *prometheus.GaugeVec
@@ -67,6 +75,10 @@ func NewMetricsWithRegistry(reg *prometheus.Registry) *Metrics {
 			Name: "engine_trades_executed_total",
 			Help: "Trades executed by the engine",
 		}),
+		SettlementFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "engine_settlement_failures_total",
+			Help: "Trade settlement events the engine failed to persist",
+		}),
 		MatchingLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "engine_matching_latency_seconds",
 			Help:    "Order matching latency",
@@ -76,6 +88,11 @@ func NewMetricsWithRegistry(reg *prometheus.Registry) *Metrics {
 			Name:    "engine_replay_latency_seconds",
 			Help:    "Command stream replay latency at startup",
 			Buckets: []float64{0.001, 0.01, 0.1, 1, 5, 30},
+		}),
+		RedisLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "engine_redis_latency_seconds",
+			Help:    "Engine Redis write latency (event stream XAdd and WS Publish)",
+			Buckets: []float64{0.0005, 0.001, 0.002, 0.005, 0.01, 0.05, 0.1, 0.5},
 		}),
 		AcquiredPartitions: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
@@ -109,8 +126,10 @@ func NewMetricsWithRegistry(reg *prometheus.Registry) *Metrics {
 		m.OrdersCanceled,
 		m.OrdersFilled,
 		m.TradesExecuted,
+		m.SettlementFailures,
 		m.MatchingLatency,
 		m.ReplayLatency,
+		m.RedisLatency,
 		m.AcquiredPartitions,
 		m.LeaseAcquire,
 		m.LeaseLosses,

@@ -1567,7 +1567,16 @@ func (e *Engine) emitEventP(
 	envType events.EventType,
 	data json.RawMessage,
 	broadcast bool,
-) error {
+) (err error) {
+
+	// A failed trade publish counts as a settlement failure; the run loop
+	// retries, so the counter track incidents rather than attempts that
+	// later succeed.
+	defer func() {
+		if err != nil && envType == events.EventTradeExecuted {
+			e.metrics.SettlementFailures.Inc()
+		}
+	}()
 
 	e.mu.RLock()
 	replaying := e.replaying[partitionID]
@@ -1614,6 +1623,7 @@ func (e *Engine) emitEventP(
 
 	// Persistence consumer: the DB worker consumes e.eventStream via a
 	// consumer group, so a crashed worker does not lose events.
+	writeStart := time.Now()
 	if err := client.XAdd(
 		context.Background(),
 		&rd.XAddArgs{
@@ -1625,9 +1635,11 @@ func (e *Engine) emitEventP(
 	).Err(); err != nil {
 		return err
 	}
+	e.metrics.RedisLatency.Observe(time.Since(writeStart).Seconds())
 
 	// WebSocket consumer: real-time fan-out to browsers.
 	if broadcast {
+		start := time.Now()
 		if err := client.Publish(
 			context.Background(),
 			e.wsChannel,
@@ -1635,6 +1647,7 @@ func (e *Engine) emitEventP(
 		).Err(); err != nil {
 			return err
 		}
+		e.metrics.RedisLatency.Observe(time.Since(start).Seconds())
 	}
 
 	// Both targets accepted the envelope. Drop it from the journal.
