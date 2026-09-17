@@ -40,10 +40,12 @@ func main() {
 
 	queries := repository.New(db)
 
-	worker := dbworker.New(
+	worker := dbworker.NewWithStreams(
 		redisManager.GetClient(),
 		db,
 		queries,
+		cfg.DBStream,
+		cfg.DBGroup,
 	)
 
 	workerCtx, cancel := context.WithCancel(ctx)

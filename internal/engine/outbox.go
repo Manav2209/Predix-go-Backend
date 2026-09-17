@@ -94,7 +94,12 @@ func (o *Outbox) ReadAll() ([][]byte, error) {
 // Recover republishes any envelopes left in the outbox (e.g. after a Redis
 // outage) and clears the journal. A Redis outage keeps the entries safe on
 // disk; they are only dropped once every target accepts them.
-func (o *Outbox) Recover(ctx context.Context, client *rd.Client) error {
+func (o *Outbox) Recover(
+	ctx context.Context,
+	client *rd.Client,
+	stream string,
+	wsChannel string,
+) error {
 	lines, err := o.ReadAll()
 	if err != nil {
 		return err
@@ -107,7 +112,13 @@ func (o *Outbox) Recover(ctx context.Context, client *rd.Client) error {
 	log.Printf("outbox: republishing %d pending event(s)", len(lines))
 
 	for _, line := range lines {
-		if err := republishEnvelope(ctx, client, line); err != nil {
+		if err := republishEnvelope(
+			ctx,
+			client,
+			line,
+			stream,
+			wsChannel,
+		); err != nil {
 			return err
 		}
 	}
@@ -117,7 +128,13 @@ func (o *Outbox) Recover(ctx context.Context, client *rd.Client) error {
 
 // republishEnvelope decodes and pushes one stored envelope to both the event
 // stream and the WebSocket channel.
-func republishEnvelope(ctx context.Context, client *rd.Client, line []byte) error {
+func republishEnvelope(
+	ctx context.Context,
+	client *rd.Client,
+	line []byte,
+	stream string,
+	wsChannel string,
+) error {
 	var env events.EventEnvelope
 
 	if err := json.Unmarshal(line, &env); err != nil {
@@ -131,20 +148,29 @@ func republishEnvelope(ctx context.Context, client *rd.Client, line []byte) erro
 		return nil
 	}
 
-	return publishEnvelope(ctx, client, envBytes, env.Type == events.EventTradeExecuted)
+	return publishEnvelope(
+		ctx,
+		client,
+		envBytes,
+		env.Type == events.EventTradeExecuted,
+		stream,
+		wsChannel,
+	)
 }
 
-// publishEnvelope writes an envelope to the durable events:out stream and, when
+// publishEnvelope writes an envelope to the durable event stream and, when
 // requested, to the WebSocket fan-out channel.
 func publishEnvelope(
 	ctx context.Context,
 	client *rd.Client,
 	envBytes []byte,
 	broadcast bool,
+	stream string,
+	wsChannel string,
 ) error {
 
 	if err := client.XAdd(ctx, &rd.XAddArgs{
-		Stream: events.EventStream,
+		Stream: stream,
 		Values: map[string]interface{}{
 			"event": string(envBytes),
 		},
@@ -153,7 +179,7 @@ func publishEnvelope(
 	}
 
 	if broadcast {
-		if err := client.Publish(ctx, events.WSChannel, envBytes).Err(); err != nil {
+		if err := client.Publish(ctx, wsChannel, envBytes).Err(); err != nil {
 			return err
 		}
 	}

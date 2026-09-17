@@ -33,6 +33,7 @@ func main() {
 		websocket.NewRedisSubscriber(
 			redisManager.GetClient(),
 			hub,
+			cfg.WSStream,
 		)
 
 	ctx, cancel := context.WithCancel(

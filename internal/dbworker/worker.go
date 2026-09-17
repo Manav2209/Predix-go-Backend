@@ -27,6 +27,11 @@ type Worker struct {
 	pool     *pgxpool.Pool
 	queries  *repository.Queries
 	consumer string
+
+	// stream/group identify the durable event stream and its consumer
+	// group. Configurable through NewWithStreams (P3.7).
+	stream string
+	group  string
 }
 
 func New(
@@ -34,11 +39,29 @@ func New(
 	pool *pgxpool.Pool,
 	queries *repository.Queries,
 ) *Worker {
+	return NewWithStreams(
+		redisClient,
+		pool,
+		queries,
+		events.EventStream,
+		events.EventGroup,
+	)
+}
+
+func NewWithStreams(
+	redisClient *redis.Client,
+	pool *pgxpool.Pool,
+	queries *repository.Queries,
+	stream string,
+	group string,
+) *Worker {
 	return &Worker{
 		redis:    redisClient,
 		pool:     pool,
 		queries:  queries,
 		consumer: uuid.NewString(),
+		stream:   stream,
+		group:    group,
 	}
 }
 
@@ -53,8 +76,8 @@ func (w *Worker) Run(ctx context.Context) error {
 	claimed, _, err := w.redis.XAutoClaim(
 		ctx,
 		&redis.XAutoClaimArgs{
-			Stream:   events.EventStream,
-			Group:    events.EventGroup,
+			Stream:   w.stream,
+			Group:    w.group,
 			Consumer: w.consumer,
 			MinIdle:  10 * time.Second,
 			Start:    "0-0",
@@ -75,9 +98,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		streams, err := w.redis.XReadGroup(
 			ctx,
 			&redis.XReadGroupArgs{
-				Group:    events.EventGroup,
+				Group:    w.group,
 				Consumer: w.consumer,
-				Streams:  []string{events.EventStream, ">"},
+				Streams:  []string{w.stream, ">"},
 				Count:    10,
 				Block:    0,
 			},
@@ -113,8 +136,8 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) ensureGroup(ctx context.Context) error {
 	err := w.redis.XGroupCreateMkStream(
 		ctx,
-		events.EventStream,
-		events.EventGroup,
+		w.stream,
+		w.group,
 		"0-0",
 	).Err()
 
@@ -149,8 +172,8 @@ func (w *Worker) processStreamEntry(
 	// Acknowledge only after the event has been durably applied.
 	return w.redis.XAck(
 		ctx,
-		events.EventStream,
-		events.EventGroup,
+		w.stream,
+		w.group,
 		entryID,
 	).Err()
 }

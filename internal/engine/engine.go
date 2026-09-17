@@ -95,6 +95,12 @@ type Engine struct {
 	// truncate an envelope another worker has not yet published.
 	emitMu sync.Mutex
 
+	// eventStream is the durable event stream the DB worker consumes;
+	// wsChannel is the fan-out channel for real-time listening. Both are
+	// configurable through SetStreamNames (P3.7).
+	eventStream string
+	wsChannel   string
+
 	// workersWG tracks the per-partition consumer goroutines. Matching is
 	// synchronous inside each consumer, so no separate processor is needed.
 	workersWG sync.WaitGroup
@@ -155,9 +161,26 @@ func newEngine(rm *redis.RedisManager, outboxPath string) (*Engine, error) {
 		partitions: make(map[int]*partitionWorker),
 		replaying: make(map[int]bool),
 
+		eventStream: events.EventStream,
+		wsChannel:   events.WSChannel,
+
 		ctx:    ctx,
 		cancel: cancel,
 	}, nil
+}
+
+// SetStreamNames overrides the durable event stream and the WebSocket fan-out
+// channel this engine publishes to (P3.7). Empty values keep the defaults.
+func (e *Engine) SetStreamNames(eventStream, wsChannel string) {
+	e.emitMu.Lock()
+	defer e.emitMu.Unlock()
+
+	if eventStream != "" {
+		e.eventStream = eventStream
+	}
+	if wsChannel != "" {
+		e.wsChannel = wsChannel
+	}
 }
 
 // SetRouter installs the partition router this engine uses for stream, group
@@ -198,7 +221,12 @@ func (e *Engine) SetLeaseSettings(engineID string, ttl, renew time.Duration) {
 func (e *Engine) Start() {
 	e.startOnce.Do(func() {
 		if e.redisManager != nil {
-			if err := e.outbox.Recover(e.ctx, e.redisManager.GetClient()); err != nil {
+			if err := e.outbox.Recover(
+				e.ctx,
+				e.redisManager.GetClient(),
+				e.eventStream,
+				e.wsChannel,
+			); err != nil {
 				log.Println("outbox recovery error:", err)
 			}
 		}
@@ -1424,12 +1452,12 @@ func (e *Engine) emitEventP(
 		}
 	}
 
-	// Persistence consumer: the DB worker consumes events:out via a
+	// Persistence consumer: the DB worker consumes e.eventStream via a
 	// consumer group, so a crashed worker does not lose events.
 	if err := client.XAdd(
 		context.Background(),
 		&rd.XAddArgs{
-			Stream: events.EventStream,
+			Stream: e.eventStream,
 			Values: map[string]interface{}{
 				"event": string(envBytes),
 			},
@@ -1442,7 +1470,7 @@ func (e *Engine) emitEventP(
 	if broadcast {
 		if err := client.Publish(
 			context.Background(),
-			events.WSChannel,
+			e.wsChannel,
 			envBytes,
 		).Err(); err != nil {
 			return err
