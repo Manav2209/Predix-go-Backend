@@ -37,29 +37,32 @@ const (
 
 // EventEnvelope wraps every domain event.
 type EventEnvelope struct {
-	ID          string          `json:"id"`
-	Type        EventType       `json:"type"`
-	PartitionID int             `json:"partitionId"`
-	Sequence    uint64          `json:"sequence"`
-	CreatedAt   time.Time       `json:"createdAt"`
-	Data        json.RawMessage `json:"data"`
+	ID           string          `json:"id"`
+	Type         EventType       `json:"type"`
+	PartitionID  int             `json:"partitionId"`
+	FencingToken uint64          `json:"fencingToken"`
+	Sequence     uint64          `json:"sequence"`
+	CreatedAt    time.Time       `json:"createdAt"`
+	Data         json.RawMessage `json:"data"`
 }
 
 type NewEnvelopeParams struct {
-	Type        EventType
-	Data        []byte
-	PartitionID int
-	Sequence    uint64
+	Type         EventType
+	Data         []byte
+	PartitionID  int
+	FencingToken uint64
+	Sequence     uint64
 }
 
 // NewEnvelope builds a fully-populated envelope.
 func NewEnvelope(p NewEnvelopeParams) EventEnvelope {
 	return EventEnvelope{
-		ID:          uuid.NewString(),
-		Type:        p.Type,
-		PartitionID: p.PartitionID,
-		Sequence:    p.Sequence,
-		CreatedAt:   time.Now().UTC(),
-		Data:        p.Data,
+		ID:           uuid.NewString(),
+		Type:         p.Type,
+		PartitionID:  p.PartitionID,
+		FencingToken: p.FencingToken,
+		Sequence:     p.Sequence,
+		CreatedAt:    time.Now().UTC(),
+		Data:         p.Data,
 	}
 }

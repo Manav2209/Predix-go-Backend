@@ -184,19 +184,17 @@ func (r *RedisManager) SendAndAwait(
 		}
 	}()
 
-	rawMsg, err := json.Marshal(msg)
-	if err != nil {
-		return nil, err
-	}
-
-	env := r.createEnvelope(
+	// The envelope stores the raw inner payload (never the MessageToEngine
+	// wrapper): the engine reconstructs the message from env.Type +
+	// env.Payload, so the wrapper must not leak in as payload.
+	envelope := r.createEnvelope(
 		CommandType(msg.Type),
 		eventID,
-		rawMsg,
+		msg.Payload,
 		partitionID,
 	)
 
-	envBytes, err := json.Marshal(env)
+	envBytes, err := json.Marshal(envelope)
 	if err != nil {
 		return nil, err
 	}

@@ -7,15 +7,15 @@ import (
 	"predix/pkg/redis"
 )
 
-// replayCommandLog re-executes every command in the durable commands stream,
-// in stream order, to reconstruct engine state (markets, orderbooks, orders
-// and the ledger) after a restart.
+// replayCommandLog re-executes every command in the partition's durable
+// command stream, in stream order, to reconstruct engine state (markets,
+// orderbooks, orders and the ledger) after a restart.
 //
 // Determinism relies on the command handlers being idempotent: re-creating an
 // event or order that already exists is a no-op, and duplicate cancellations
 // are rejected. Event emission is suppressed during replay because the DB
 // projection already contains those effects.
-func (e *Engine) replayCommandLog() error {
+func (e *Engine) replayCommandLog(partitionID int) error {
 	if e.redisManager == nil {
 		return nil
 	}
@@ -28,7 +28,7 @@ func (e *Engine) replayCommandLog() error {
 
 	entries, err := client.XRange(
 		e.ctx,
-		e.router.Stream(e.partitionID),
+		e.router.Stream(partitionID),
 		"-",
 		"+",
 	).Result()
@@ -38,12 +38,12 @@ func (e *Engine) replayCommandLog() error {
 	}
 
 	e.mu.Lock()
-	e.replaying = true
+	e.replaying[partitionID] = true
 	e.mu.Unlock()
 
 	defer func() {
 		e.mu.Lock()
-		e.replaying = false
+		delete(e.replaying, partitionID)
 		e.mu.Unlock()
 	}()
 
@@ -62,22 +62,26 @@ func (e *Engine) replayCommandLog() error {
 			continue
 		}
 
-		e.applyCommand(env)
+		e.applyCommand(partitionID, env)
 	}
 
-	log.Printf("replayed %d command(s) from stream", len(entries))
+	log.Printf(
+		"replayed %d command(s) from stream (partition %d)",
+		len(entries),
+		partitionID,
+	)
 
 	return nil
 }
 
 // applyCommand re-executes a single command envelope. Replay and live
 // consumption share this entry point so behaviour cannot drift.
-func (e *Engine) applyCommand(env redis.CommandEnvelope) {
+func (e *Engine) applyCommand(partitionID int, env redis.CommandEnvelope) {
 	if env.Type == "" {
 		return
 	}
 
-	e.handleMessage(redis.MessageToEngine{
+	e.handleMessage(partitionID, redis.MessageToEngine{
 		Type:    env.Type,
 		Payload: env.Payload,
 	})

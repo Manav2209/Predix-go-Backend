@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -51,7 +53,6 @@ type Engine struct {
 	positions map[string]*Position
 
 	redisManager *redis.RedisManager
-	wal          *WAL
 	metrics      *Metrics
 
 	// consumerName identifies this engine instance to the stream consumer
@@ -59,28 +60,44 @@ type Engine struct {
 	// after a crash.
 	consumerName string
 
-	// partitionID is this engine's partition. Phase 1 uses a single
-	// partition (0); the value is stamped on every emitted envelope.
-	partitionID int
+	// engineID is the stable instance identifier stamped on partition
+	// leases. A unique value per instance ensures a lease can never be
+	// renewed by a different process.
+	engineID string
+
+	leaseTTL          time.Duration
+	leaseRenewInterval time.Duration
 
 	// router owns partition routing and stream/group/sequence naming.
 	router *partition.Router
 
-	// eventSequence is a monotonically increasing counter per envelope,
-	// giving downstream consumers a stable ordering hint.
-	eventSequence atomic.Uint64
+	// partitionSeq holds the per-partition event sequence counters (P2.8).
+	// Indexed by partitionID, sized to router.Partitions.
+	partitionSeq []atomic.Uint64
 
-	// replaying is true while the command log is being re-executed at
-	// startup. Emitted events are suppressed so the DB projection is not
-	// double-written.
-	replaying bool
+	// partitionToken holds the active fencing token per partition (P2.5).
+	// Read/Write under mu.
+	partitionToken map[int]uint64
+
+	// partitions tracks the configured partition workers (P2.3).
+	partitions map[int]*partitionWorker
+
+	// replaying marks the partitions currently re-executing their command
+	// log at startup. Emitted events are suppressed so the DB projection is
+	// not double-written.
+	replaying map[int]bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// consumerWG tracks the Redis stream consumer goroutine. Matching is
-	// synchronous inside the consumer, so no separate processor is needed.
-	consumerWG sync.WaitGroup
+	// emitMu serializes the full emit cycle (outbox append → XAdd →
+	// publish → outbox reset) so concurrent partition workers cannot
+	// truncate an envelope another worker has not yet published.
+	emitMu sync.Mutex
+
+	// workersWG tracks the per-partition consumer goroutines. Matching is
+	// synchronous inside each consumer, so no separate processor is needed.
+	workersWG sync.WaitGroup
 
 	outbox *Outbox
 
@@ -88,17 +105,28 @@ type Engine struct {
 	stopOnce  sync.Once
 }
 
+// defaultLease values are conservative for a single-engine deployment; they
+// are tuned through SetLeaseSettings / config in a distributed deployment.
+const (
+	defaultLeaseTTL          = 15 * time.Second
+	defaultLeaseRenewInterval = 5 * time.Second
+)
+
 func NewEngine(rm *redis.RedisManager) (*Engine, error) {
+	return newEngine(rm, "data/outbox.log")
+}
+
+// newEngine is NewEngine with an explicit outbox path (tests use a temp dir).
+func newEngine(rm *redis.RedisManager, outboxPath string) (*Engine, error) {
 	if rm == nil {
 		return nil, errors.New("redis manager is required")
 	}
 
-	wal, err := NewWAL("data/wal.log")
-	if err != nil {
-		return nil, fmt.Errorf("create WAL: %w", err)
+	if err := os.MkdirAll(filepath.Dir(outboxPath), 0o755); err != nil {
+		return nil, fmt.Errorf("create outbox dir: %w", err)
 	}
 
-	outbox, err := NewOutbox("data/outbox.log")
+	outbox, err := NewOutbox(outboxPath)
 	if err != nil {
 		return nil, fmt.Errorf("create outbox: %w", err)
 	}
@@ -106,47 +134,88 @@ func NewEngine(rm *redis.RedisManager) (*Engine, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Engine{
-		markets:      make(map[string]*Market),
-		orders:       make(map[string]*Order),
-		balances:     make(map[string]*Balance),
-		positions:    make(map[string]*Position),
+		markets:   make(map[string]*Market),
+		orders:    make(map[string]*Order),
+		balances:  make(map[string]*Balance),
+		positions: make(map[string]*Position),
 
 		redisManager: rm,
-		wal:          wal,
 		outbox:       outbox,
 		metrics:      NewMetrics(),
 
 		consumerName: uuid.NewString(),
-		partitionID:  0,
-		router:       partition.NewRouter(1, "commands"),
+		engineID:     "engine-0",
+
+		leaseTTL:           defaultLeaseTTL,
+		leaseRenewInterval: defaultLeaseRenewInterval,
+
+		router:    partition.NewRouter(1, "commands"),
+		partitionSeq: []atomic.Uint64{{}},
+		partitionToken: make(map[int]uint64),
+		partitions: make(map[int]*partitionWorker),
+		replaying: make(map[int]bool),
 
 		ctx:    ctx,
 		cancel: cancel,
 	}, nil
 }
 
+// SetRouter installs the partition router this engine uses for stream, group
+// and sequence-key naming. It must be called before any partition is added.
+func (e *Engine) SetRouter(r *partition.Router) {
+	if r == nil {
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	seq := make([]atomic.Uint64, r.Partitions)
+	copy(seq, e.partitionSeq)
+	e.partitionSeq = seq
+	e.router = r
+}
+
+// SetLeaseSettings configures lease ownership parameters. ENGINE_ID must be
+// unique per process.
+func (e *Engine) SetLeaseSettings(engineID string, ttl, renew time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if engineID != "" {
+		e.engineID = engineID
+	}
+
+	if ttl > 0 {
+		e.leaseTTL = ttl
+	}
+
+	if renew > 0 {
+		e.leaseRenewInterval = renew
+	}
+}
+
 func (e *Engine) Start() {
 	e.startOnce.Do(func() {
-		log.Println("Engine started. Replaying command log...")
-
-		if err := e.replayCommandLog(); err != nil {
-			log.Println("replay error:", err)
-		}
-
 		if e.redisManager != nil {
 			if err := e.outbox.Recover(e.ctx, e.redisManager.GetClient()); err != nil {
 				log.Println("outbox recovery error:", err)
 			}
 		}
 
-		log.Println("Engine replay complete. Waiting for orders...")
+		for pid, worker := range e.partitions {
+			e.workersWG.Add(1)
 
-		e.consumerWG.Add(1)
+			go func(pid int, w *partitionWorker) {
+				defer e.workersWG.Done()
+				e.runPartition(pid, w)
+			}(pid, worker)
+		}
 
-		go func() {
-			defer e.consumerWG.Done()
-			e.consumeMessages()
-		}()
+		log.Printf(
+			"Engine started: %d partition worker(s) running",
+			len(e.partitions),
+		)
 	})
 }
 
@@ -155,13 +224,7 @@ func (e *Engine) Shutdown(ctx context.Context) {
 		log.Println("Shutting down engine...")
 
 		e.cancel()
-		e.consumerWG.Wait()
-
-		if e.wal != nil {
-			if err := e.wal.Close(); err != nil {
-				log.Println("WAL close error:", err)
-			}
-		}
+		e.workersWG.Wait()
 
 		if e.outbox != nil {
 			if err := e.outbox.Close(); err != nil {
@@ -176,21 +239,21 @@ func (e *Engine) Shutdown(ctx context.Context) {
 }
 
 
-func (e *Engine) consumeMessages() {
+func (e *Engine) consumeMessages(ctx context.Context, partitionID int) {
 	client := e.redisManager.GetClient()
 
-	if err := e.ensureCommandGroup(client); err != nil {
+	if err := e.ensureCommandGroup(ctx, partitionID); err != nil {
 		log.Println("stream group setup error:", err)
 		return
 	}
 
-	stream := e.router.Stream(e.partitionID)
-	group := e.router.Group(e.partitionID)
+	stream := e.router.Stream(partitionID)
+	group := e.router.Group(partitionID)
 
 	// Reclaim pending entries left by a crashed instance within our group
 	// (MinIdle ensures we never steal work a live engine is still processing).
 	claimed, _, err := client.XAutoClaim(
-		e.ctx,
+		ctx,
 		&rd.XAutoClaimArgs{
 			Stream:   stream,
 			Group:    group,
@@ -205,19 +268,22 @@ func (e *Engine) consumeMessages() {
 	}
 
 	for _, msg := range claimed {
-		e.processStreamEntry(client, msg.ID, msg.Values)
+		e.processStreamEntry(ctx, partitionID, client, msg.ID, msg.Values)
 	}
 
 	for {
-		// Block for the next command in the group.
+		// Block for the next command in the group. The block time is
+		// bounded so the loop observes context cancellation and lease
+		// loss promptly; shutdown does not wait for an outstanding
+		// blocking read on the server.
 		streams, err := client.XReadGroup(
-			e.ctx,
+			ctx,
 			&rd.XReadGroupArgs{
 				Group:    group,
 				Consumer: e.consumerName,
 				Streams:  []string{stream, ">"},
 				Count:    10,
-				Block:    0,
+				Block:    500 * time.Millisecond,
 			},
 		).Result()
 
@@ -230,7 +296,7 @@ func (e *Engine) consumeMessages() {
 
 			select {
 			case <-time.After(time.Second):
-			case <-e.ctx.Done():
+			case <-ctx.Done():
 				return
 			}
 
@@ -239,17 +305,17 @@ func (e *Engine) consumeMessages() {
 
 		for _, s := range streams {
 			for _, msg := range s.Messages {
-				e.processStreamEntry(client, msg.ID, msg.Values)
+				e.processStreamEntry(ctx, partitionID, client, msg.ID, msg.Values)
 			}
 		}
 	}
 }
 
-func (e *Engine) ensureCommandGroup(client *rd.Client) error {
-	err := client.XGroupCreateMkStream(
-		e.ctx,
-		e.router.Stream(e.partitionID),
-		e.router.Group(e.partitionID),
+func (e *Engine) ensureCommandGroup(ctx context.Context, partitionID int) error {
+	err := e.redisManager.GetClient().XGroupCreateMkStream(
+		ctx,
+		e.router.Stream(partitionID),
+		e.router.Group(partitionID),
 		"0-0",
 	).Err()
 
@@ -261,6 +327,8 @@ func (e *Engine) ensureCommandGroup(client *rd.Client) error {
 }
 
 func (e *Engine) processStreamEntry(
+	ctx context.Context,
+	partitionID int,
 	client *rd.Client,
 	entryID string,
 	values map[string]interface{},
@@ -270,9 +338,9 @@ func (e *Engine) processStreamEntry(
 		// If we crash in between, the entry stays pending and is redelivered
 		// on restart (XAUTOCLAIM), making the command stream at-least-once.
 		if ackErr := client.XAck(
-			e.ctx,
-			e.router.Stream(e.partitionID),
-			e.router.Group(e.partitionID),
+			ctx,
+			e.router.Stream(partitionID),
+			e.router.Group(partitionID),
 			entryID,
 		).Err(); ackErr != nil && !errors.Is(ackErr, context.Canceled) {
 			log.Println("XAck error:", ackErr)
@@ -304,13 +372,14 @@ func (e *Engine) processStreamEntry(
 	}
 
 	log.Printf(
-		"Received command type=%s clientId=%s sequence=%d",
+		"Received command type=%s clientId=%s sequence=%d partition=%d",
 		env.Type,
 		clientID,
 		env.Sequence,
+		partitionID,
 	)
 
-	response := e.handleMessage(redis.MessageToEngine{
+	response := e.handleMessage(partitionID, redis.MessageToEngine{
 		Type:    env.Type,
 		Payload: env.Payload,
 	})
@@ -327,7 +396,7 @@ func (e *Engine) processStreamEntry(
 	}
 
 	if err := client.Publish(
-		e.ctx,
+		ctx,
 		clientID,
 		respBytes,
 	).Err(); err != nil {
@@ -339,16 +408,17 @@ func (e *Engine) processStreamEntry(
 }
 
 func (e *Engine) handleMessage(
+	partitionID int,
 	msg redis.MessageToEngine,
 ) *redis.EngineResponse {
 
 	switch msg.Type {
 
 	case string(redis.CreateOrderCommand):
-		return e.handleCreateOrder(msg.Payload)
+		return e.handleCreateOrderP(partitionID, msg.Payload)
 
 	case string(redis.CancelOrderCommand):
-		return e.handleCancelOrder(msg.Payload)
+		return e.handleCancelOrderP(partitionID, msg.Payload)
 
 	case string(redis.GetDepthCommand):
 		return e.handleGetDepth(msg.Payload)
@@ -403,7 +473,16 @@ func (e *Engine) handleCreateEvent(
 	})
 }
 
+// handleCreateOrder is the partition-agnostic entry point used by tests. The
+// partition-aware path (handleCreateOrderP) is used by live consumers.
 func (e *Engine) handleCreateOrder(
+	payload json.RawMessage,
+) *redis.EngineResponse {
+	return e.handleCreateOrderP(0, payload)
+}
+
+func (e *Engine) handleCreateOrderP(
+	partitionID int,
 	payload json.RawMessage,
 ) *redis.EngineResponse {
 
@@ -489,24 +568,9 @@ func (e *Engine) handleCreateOrder(
 
 	e.mu.Unlock()
 
-	// WAL must succeed before the order enters
-	// the matching queue.
-	if e.wal != nil {
-		// Replay re-applies reservations from the reconstructed ledger,
-		// so WAL writes are skipped during replay to avoid re-appending.
-		if !e.replaying {
-			if err := e.wal.Write(order); err != nil {
-				e.mu.Lock()
-				delete(e.orders, order.ID)
-				order.Status = StatusRejected
-				e.mu.Unlock()
-
-				return failure(
-					fmt.Sprintf("failed to persist order: %v", err),
-				)
-			}
-		}
-	}
+	// The command stream (partition commands:{partition}) is the durable
+	// log. Replaying that stream on startup reconstructs the ledger, so
+	// no separate WAL is needed.
 
 	// Notify the DB worker BEFORE the order can be matched, so the events
 	// stream always sees ORDER_CREATED ahead of any TRADE_EXECUTED for it.
@@ -520,7 +584,8 @@ func (e *Engine) handleCreateOrder(
 		return failure("failed to serialize order")
 	}
 
-	if err := e.emitEvent(
+	if err := e.emitEventP(
+		partitionID,
 		events.EventOrderCreated,
 		orderData,
 		false,
@@ -535,7 +600,7 @@ func (e *Engine) handleCreateOrder(
 
 	// Match synchronously so the response reflects the resulting state
 	// instead of a stale PENDING.
-	e.matchOrder(order)
+	e.matchOrder(order, partitionID)
 
 	return successJSON(map[string]any{
 		"orderId":          order.ID,
@@ -590,7 +655,7 @@ func validateOrder(order *Order) error {
 	return nil
 }
 
-func (e *Engine) matchOrder(order *Order) []*Trade {
+func (e *Engine) matchOrder(order *Order, partitionID int) []*Trade {
 	e.mu.Lock()
 
 	// Cancellation can happen while the order is waiting
@@ -660,7 +725,7 @@ func (e *Engine) matchOrder(order *Order) []*Trade {
 	// event emission is suppressed: the DB projection already contains the
 	// effects.
 	e.mu.RLock()
-	replaying := e.replaying
+	replaying := e.replaying[partitionID]
 	e.mu.RUnlock()
 
 	if replaying {
@@ -668,7 +733,7 @@ func (e *Engine) matchOrder(order *Order) []*Trade {
 	}
 
 	for _, trade := range trades {
-		if err := e.publishTrade(trade); err != nil {
+		if err := e.publishTrade(partitionID, trade); err != nil {
 			log.Printf(
 				"failed to publish trade %s: %v",
 				trade.ID,
@@ -934,6 +999,13 @@ func buildTrade(
 func (e *Engine) handleCancelOrder(
 	payload json.RawMessage,
 ) *redis.EngineResponse {
+	return e.handleCancelOrderP(0, payload)
+}
+
+func (e *Engine) handleCancelOrderP(
+	partitionID int,
+	payload json.RawMessage,
+) *redis.EngineResponse {
 
 	var req struct {
 		OrderID string `json:"orderId"`
@@ -1006,7 +1078,8 @@ func (e *Engine) handleCancelOrder(
 		"orderId": order.ID,
 	})
 
-	if err := e.emitEvent(
+	if err := e.emitEventP(
+		partitionID,
 		events.EventOrderCanceled,
 		cancelData,
 		false,
@@ -1268,6 +1341,7 @@ func (e *Engine) handleGetOpenOrders(
 }
 
 func (e *Engine) publishTrade(
+	partitionID int,
 	trade *Trade,
 ) error {
 
@@ -1276,31 +1350,45 @@ func (e *Engine) publishTrade(
 		return err
 	}
 
-	return e.emitEvent(
+	return e.emitEventP(
+		partitionID,
 		events.EventTradeExecuted,
 		data,
 		true,
 	)
 }
 
-// emitEvent stamps an envelope with this engine's partition and sequence,
-// appends it to the events:out stream for persistence, and optionally
-// publishes the same envelope to the WebSocket channel for fan-out.
+// emitEvent is the partition-agnostic entry point used by tests. Live
+// consumers go through emitEventP.
+func (e *Engine) emitEvent(
+	envType events.EventType,
+	data json.RawMessage,
+	broadcast bool,
+) error {
+	return e.emitEventP(0, envType, data, broadcast)
+}
+
+// emitEventP stamps an envelope with the processing partition, its fencing
+// token (P2.5) and a per-partition sequence (P2.8), appends it to the
+// events:out stream for persistence, and optionally publishes the same
+// envelope to the WebSocket channel for fan-out.
 //
 // It never runs while the engine mutex is held.
-func (e *Engine) emitEvent(
+func (e *Engine) emitEventP(
+	partitionID int,
 	envType events.EventType,
 	data json.RawMessage,
 	broadcast bool,
 ) error {
 
 	e.mu.RLock()
-	replaying := e.replaying
+	replaying := e.replaying[partitionID]
+	token := e.partitionToken[partitionID]
 	e.mu.RUnlock()
 
 	// During startup replay the DB projection already holds these effects;
-	// re-emitting them would double-write. This is the single gate that
-	// makes replay non-mutating minus the in-memory state.
+	// re-emitting them would double-write. This gate makes replay
+	// non-mutating minus the in-memory state.
 	if replaying {
 		return nil
 	}
@@ -1310,10 +1398,11 @@ func (e *Engine) emitEvent(
 	}
 
 	envelope := events.NewEnvelope(events.NewEnvelopeParams{
-		Type:        envType,
-		Data:        data,
-		PartitionID: e.partitionID,
-		Sequence:    e.eventSequence.Add(1),
+		Type:         envType,
+		Data:         data,
+		PartitionID:  partitionID,
+		FencingToken: token,
+		Sequence:     e.partitionSeq[partitionID].Add(1),
 	})
 
 	envBytes, err := json.Marshal(envelope)
@@ -1323,8 +1412,12 @@ func (e *Engine) emitEvent(
 
 	client := e.redisManager.GetClient()
 
-	// Append to the durable outbox first: if Redis is unreachable the
-	// envelope survives on disk and is republished after a restart.
+	// Serialize the emit cycle (see emitMu). Envelopes are written to the
+	// durable outbox first: if Redis is unreachable the envelope survives
+	// on disk and is republished after a restart.
+	e.emitMu.Lock()
+	defer e.emitMu.Unlock()
+
 	if e.outbox != nil {
 		if err := e.outbox.Append(envBytes); err != nil {
 			return err
