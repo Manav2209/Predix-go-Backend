@@ -21,6 +21,7 @@ func testEngine(t *testing.T) *Engine {
 		partitionToken: make(map[int]uint64),
 		partitions:     make(map[int]*partitionWorker),
 		replaying:      make(map[int]bool),
+		metrics:        NewMetrics(),
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"predix/pkg/redis"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	rd "github.com/redis/go-redis/v9"
 )
 
@@ -30,7 +31,7 @@ var (
 	ErrOrderNotCancelable = errors.New("order cannot be canceled")
 	ErrInvalidOrder       = errors.New("invalid order")
 
-	ErrInsufficientFunds = errors.New("insufficient balance for order")
+	ErrInsufficientFunds  = errors.New("insufficient balance for order")
 	ErrInsufficientShares = errors.New("insufficient shares for order")
 )
 
@@ -65,7 +66,7 @@ type Engine struct {
 	// renewed by a different process.
 	engineID string
 
-	leaseTTL          time.Duration
+	leaseTTL           time.Duration
 	leaseRenewInterval time.Duration
 
 	// router owns partition routing and stream/group/sequence naming.
@@ -114,7 +115,7 @@ type Engine struct {
 // defaultLease values are conservative for a single-engine deployment; they
 // are tuned through SetLeaseSettings / config in a distributed deployment.
 const (
-	defaultLeaseTTL          = 15 * time.Second
+	defaultLeaseTTL           = 15 * time.Second
 	defaultLeaseRenewInterval = 5 * time.Second
 )
 
@@ -155,11 +156,11 @@ func newEngine(rm *redis.RedisManager, outboxPath string) (*Engine, error) {
 		leaseTTL:           defaultLeaseTTL,
 		leaseRenewInterval: defaultLeaseRenewInterval,
 
-		router:    partition.NewRouter(1, "commands"),
-		partitionSeq: []atomic.Uint64{{}},
+		router:         partition.NewRouter(1, "commands"),
+		partitionSeq:   []atomic.Uint64{{}},
 		partitionToken: make(map[int]uint64),
-		partitions: make(map[int]*partitionWorker),
-		replaying: make(map[int]bool),
+		partitions:     make(map[int]*partitionWorker),
+		replaying:      make(map[int]bool),
 
 		eventStream: events.EventStream,
 		wsChannel:   events.WSChannel,
@@ -266,6 +267,27 @@ func (e *Engine) Shutdown(ctx context.Context) {
 	_ = ctx
 }
 
+// isReplaying reports whether partitionID is currently re-executing its
+// command stream. Live-only observations (metrics, event emission) must gate
+// on it so a restart does not double-count.
+func (e *Engine) isReplaying(partitionID int) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.replaying[partitionID]
+}
+
+// OwnedPartitions returns how many partition leases this engine currently
+// holds. Used by the readiness probe (P3.5).
+func (e *Engine) OwnedPartitions() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.partitionToken)
+}
+
+// MetricsRegistry exposes the engine's Prometheus registry (P3.4).
+func (e *Engine) MetricsRegistry() *prometheus.Registry {
+	return e.metrics.Registry
+}
 
 func (e *Engine) consumeMessages(ctx context.Context, partitionID int) {
 	client := e.redisManager.GetClient()
@@ -514,6 +536,30 @@ func (e *Engine) handleCreateOrderP(
 	payload json.RawMessage,
 ) *redis.EngineResponse {
 
+	start := time.Now()
+
+	resp := e.handleCreateOrderCore(partitionID, payload)
+
+	// Order lifecycle counts and latencies must not be inflated by startup
+	// replay.
+	if !e.isReplaying(partitionID) {
+		e.metrics.OrderLatency.Observe(time.Since(start).Seconds())
+
+		if resp.Success {
+			e.metrics.OrdersAccepted.Inc()
+		} else {
+			e.metrics.OrdersRejected.Inc()
+		}
+	}
+
+	return resp
+}
+
+func (e *Engine) handleCreateOrderCore(
+	partitionID int,
+	payload json.RawMessage,
+) *redis.EngineResponse {
+
 	var req struct {
 		OrderID   string `json:"orderId"`
 		EventID   string `json:"eventId"`
@@ -628,12 +674,16 @@ func (e *Engine) handleCreateOrderP(
 
 	// Match synchronously so the response reflects the resulting state
 	// instead of a stale PENDING.
+	matchStart := time.Now()
 	e.matchOrder(order, partitionID)
+	e.metrics.MatchingLatency.Observe(time.Since(matchStart).Seconds())
+
+	e.metrics.OrdersProcessed.Inc()
 
 	return successJSON(map[string]any{
-		"orderId":          order.ID,
-		"status":           order.Status,
-		"filledQuantity":   order.FilledQuantity,
+		"orderId":           order.ID,
+		"status":            order.Status,
+		"filledQuantity":    order.FilledQuantity,
 		"remainingQuantity": order.RemainingQuantity,
 	})
 }
@@ -760,7 +810,13 @@ func (e *Engine) matchOrder(order *Order, partitionID int) []*Trade {
 		return trades
 	}
 
+	if order.Status == StatusFilled {
+		e.metrics.OrdersFilled.Inc()
+	}
+
 	for _, trade := range trades {
+		e.metrics.TradesExecuted.Inc()
+
 		if err := e.publishTrade(partitionID, trade); err != nil {
 			log.Printf(
 				"failed to publish trade %s: %v",
@@ -1101,6 +1157,10 @@ func (e *Engine) handleCancelOrderP(
 	e.releaseOrderLocked(order)
 
 	e.mu.Unlock()
+
+	if !e.isReplaying(partitionID) {
+		e.metrics.OrdersCanceled.Inc()
+	}
 
 	cancelData, _ := json.Marshal(map[string]any{
 		"orderId": order.ID,

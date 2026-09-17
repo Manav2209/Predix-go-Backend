@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"predix/internal/observability"
 	"predix/internal/websocket"
 	"predix/pkg/config"
 	"predix/pkg/redis"
@@ -36,9 +38,7 @@ func main() {
 			cfg.WSStream,
 		)
 
-	ctx, cancel := context.WithCancel(
-		context.Background(),
-	)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	defer cancel()
 
@@ -53,6 +53,22 @@ func main() {
 
 	}()
 
+	// P3.4/P3.5: metrics + health for the WS process.
+	ops := observability.NewOps(nil)
+
+	ops.AddCheck("redis", func(ctx context.Context) error {
+		return redisManager.GetClient().Ping(ctx).Err()
+	})
+
+	opsCtx, opsCancel := context.WithCancel(context.Background())
+	defer opsCancel()
+
+	go func() {
+		if err := ops.Run(opsCtx, ":"+cfg.OpsPort); err != nil {
+			log.Printf("ops server stopped: %v", err)
+		}
+	}()
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc(
@@ -61,7 +77,7 @@ func main() {
 	)
 
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    ":" + cfg.WSPort,
 		Handler: mux,
 
 		ReadHeaderTimeout: 5 * time.Second,
@@ -69,12 +85,13 @@ func main() {
 
 	go func() {
 
-		log.Println(
-			"WebSocket server running on :8080",
+		log.Printf(
+			"WebSocket server running on :%s",
+			cfg.WSPort,
 		)
 
 		if err := server.ListenAndServe(); err != nil &&
-			err != http.ErrServerClosed {
+			!errors.Is(err, http.ErrServerClosed) {
 
 			log.Fatal(err)
 		}
@@ -97,6 +114,7 @@ func main() {
 		"Shutting down WebSocket server",
 	)
 
+	opsCancel()
 	cancel()
 
 	shutdownCtx, shutdownCancel :=

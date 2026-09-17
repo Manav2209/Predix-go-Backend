@@ -99,6 +99,11 @@ func (e *Engine) runPartition(partitionID int, _ *partitionWorker) {
 		e.partitionToken[partitionID] = token
 		e.mu.Unlock()
 
+		e.metrics.LeaseAcquire.WithLabelValues(
+			e.engineID,
+			fmt.Sprintf("%d", partitionID),
+		).Inc()
+
 		e.metrics.AcquiredPartitions.WithLabelValues(
 			e.engineID,
 			fmt.Sprintf("%d", partitionID),

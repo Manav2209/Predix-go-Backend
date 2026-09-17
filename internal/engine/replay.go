@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/json"
 	"log"
+	"time"
 
 	"predix/pkg/redis"
 )
@@ -47,6 +48,8 @@ func (e *Engine) replayCommandLog(partitionID int) error {
 		e.mu.Unlock()
 	}()
 
+	start := time.Now()
+
 	for _, msg := range entries {
 
 		raw, _ := msg.Values["command"].(string)
@@ -64,6 +67,8 @@ func (e *Engine) replayCommandLog(partitionID int) error {
 
 		e.applyCommand(partitionID, env)
 	}
+
+	e.metrics.ReplayLatency.Observe(time.Since(start).Seconds())
 
 	log.Printf(
 		"replayed %d command(s) from stream (partition %d)",
