@@ -12,6 +12,7 @@ import (
 
 	"predix/internal/observability"
 	"predix/internal/websocket"
+	"predix/pkg/auth"
 	"predix/pkg/config"
 	"predix/pkg/redis"
 )
@@ -19,6 +20,8 @@ import (
 func main() {
 
 	cfg := config.Load()
+
+	auth.Init(cfg.JWTSecret)
 
 	redisManager := redis.NewRedisManager(
 		cfg.RedisURL,
@@ -30,6 +33,8 @@ func main() {
 	hub := websocket.NewHub()
 
 	wsServer := websocket.NewServer(hub)
+
+	wsServer.RequireAuth = true
 
 	redisSubscriber :=
 		websocket.NewRedisSubscriber(
