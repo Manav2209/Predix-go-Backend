@@ -43,8 +43,7 @@ func (h *Hub) Unregister(c *Client) {
 		c,
 	)
 
-	for eventID, clients :=
-		range h.subscriptions {
+	for eventID, clients := range h.subscriptions {
 
 		delete(
 			clients,

@@ -493,11 +493,11 @@ func (w *Worker) settleTrade(
 		5. Ledger entries.
 	*/
 	if err := w.insertTransaction(ctx, qtx, repository.InsertTransactionParams{
-		UserID:  buyerID,
-		OrderID: pgtype.UUID{Bytes: takerOrderID, Valid: true},
-		TradeID: pgtype.UUID{Bytes: tradeID, Valid: true},
-		Type:    "BUY",
-		Outcome: pgtype.Text{String: trade.Outcome, Valid: true},
+		UserID:   buyerID,
+		OrderID:  pgtype.UUID{Bytes: takerOrderID, Valid: true},
+		TradeID:  pgtype.UUID{Bytes: tradeID, Valid: true},
+		Type:     "BUY",
+		Outcome:  pgtype.Text{String: trade.Outcome, Valid: true},
 		Quantity: numericFromInt(trade.Quantity),
 		Price:    numericFromScaled(trade.Price),
 		Amount:   numericFromScaled(total),
@@ -506,11 +506,11 @@ func (w *Worker) settleTrade(
 	}
 
 	if err := w.insertTransaction(ctx, qtx, repository.InsertTransactionParams{
-		UserID:  sellerID,
-		OrderID: pgtype.UUID{Bytes: makerOrderID, Valid: true},
-		TradeID: pgtype.UUID{Bytes: tradeID, Valid: true},
-		Type:    "SELL",
-		Outcome: pgtype.Text{String: trade.Outcome, Valid: true},
+		UserID:   sellerID,
+		OrderID:  pgtype.UUID{Bytes: makerOrderID, Valid: true},
+		TradeID:  pgtype.UUID{Bytes: tradeID, Valid: true},
+		Type:     "SELL",
+		Outcome:  pgtype.Text{String: trade.Outcome, Valid: true},
 		Quantity: numericFromInt(trade.Quantity),
 		Price:    numericFromScaled(trade.Price),
 		Amount:   numericFromScaled(total),

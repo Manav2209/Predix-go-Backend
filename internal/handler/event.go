@@ -60,16 +60,15 @@ func (h *Handler) CreateEvent(c *gin.Context) {
 		Description: req.Description,
 		Question:    req.Question,
 		Thumbnail:   req.ImageURL,
-		ExpiresAt: 	pgtype.Timestamptz{
-				Time:  expiresAt,
-				Valid: true, // Tells pgx this is NOT a NULL database value
-			}, 
+		ExpiresAt: pgtype.Timestamptz{
+			Time:  expiresAt,
+			Valid: true, // Tells pgx this is NOT a NULL database value
+		},
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create event", "success": false})
 		return
 	}
-
 
 	payload := map[string]interface{}{
 		"eventId":   event.ID.String(),

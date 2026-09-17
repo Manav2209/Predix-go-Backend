@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"predix/pkg/redis"
-	
+
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )

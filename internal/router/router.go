@@ -1,9 +1,9 @@
 package router
 
 import (
+	"github.com/gin-gonic/gin"
 	"predix/internal/handler"
 	"predix/internal/middleware"
-	"github.com/gin-gonic/gin"
 )
 
 func SetupRoutes(r *gin.Engine, h *handler.Handler) {

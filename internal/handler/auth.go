@@ -3,13 +3,13 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
 	"net/http"
 	"predix/internal/dto"
 	"predix/internal/repository"
 	"predix/pkg/auth"
 	"predix/pkg/redis"
-	"golang.org/x/crypto/bcrypt"
-	"github.com/gin-gonic/gin"
 )
 
 func (h *Handler) Signup(c *gin.Context) {
