@@ -14,16 +14,26 @@ import (
 type RedisSubscriber struct {
 	client *redis.Client
 	hub    *Hub
+
+	// channel is the Redis pub/sub channel carrying event envelopes
+	// (P3.7: configurable, default ws:updates).
+	channel string
 }
 
 func NewRedisSubscriber(
 	client *redis.Client,
 	hub *Hub,
+	channel string,
 ) *RedisSubscriber {
 
+	if channel == "" {
+		channel = events.WSChannel
+	}
+
 	return &RedisSubscriber{
-		client: client,
-		hub:    hub,
+		client:  client,
+		hub:     hub,
+		channel: channel,
 	}
 }
 
@@ -33,7 +43,7 @@ func (s *RedisSubscriber) Run(
 
 	pubsub := s.client.Subscribe(
 		ctx,
-		events.WSChannel,
+		s.channel,
 	)
 
 	defer pubsub.Close()

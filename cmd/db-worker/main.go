@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"predix/internal/dbworker"
+	"predix/internal/observability"
 	"predix/internal/repository"
 	"predix/pkg/config"
 	"predix/pkg/redis"
@@ -40,22 +41,43 @@ func main() {
 
 	queries := repository.New(db)
 
-	worker := dbworker.New(
+	worker := dbworker.NewWithStreams(
 		redisManager.GetClient(),
 		db,
 		queries,
+		cfg.DBStream,
+		cfg.DBGroup,
 	)
 
-	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// P3.4/P3.5: metrics + health for the DB worker process.
+	ops := observability.NewOps(nil)
+
+	ops.AddCheck("redis", func(ctx context.Context) error {
+		return redisManager.GetClient().Ping(ctx).Err()
+	})
+
+	ops.AddCheck("postgres", func(ctx context.Context) error {
+		return db.Ping(ctx)
+	})
+
+	opsCtx, opsCancel := context.WithCancel(ctx)
+	defer opsCancel()
 
 	go func() {
-		if err := worker.Run(workerCtx); err != nil {
-			log.Println(
-				"DB worker stopped:",
-				err,
-			)
+		if err := ops.Run(opsCtx, ":"+cfg.OpsPort); err != nil {
+			log.Printf("ops server stopped: %v", err)
 		}
+	}()
+
+	workerCtx, workerCancel := context.WithCancel(ctx)
+	defer workerCancel()
+
+	workerDone := make(chan error, 1)
+
+	log.Println("DB worker started")
+
+	go func() {
+		workerDone <- worker.Run(workerCtx)
 	}()
 
 	signalChan := make(chan os.Signal, 1)
@@ -70,13 +92,16 @@ func main() {
 
 	log.Println("shutting down DB worker")
 
-	cancel()
+	opsCancel()
+	workerCancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(
-		context.Background(),
-		10*time.Second,
-	)
-	defer shutdownCancel()
-
-	<-shutdownCtx.Done()
+	// Bound the worker drain so shutdown always completes (P3.6).
+	select {
+	case err := <-workerDone:
+		if err != nil {
+			log.Printf("DB worker stopped with error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		log.Println("DB worker drain timed out")
+	}
 }

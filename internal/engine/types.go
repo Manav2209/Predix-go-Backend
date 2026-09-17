@@ -59,12 +59,12 @@ type Position struct {
 }
 
 type Order struct {
-	ID        string    `json:"id"`
-	EventID   string    `json:"eventId"`
-	UserID    string    `json:"userId"`
-	OrderType string    `json:"orderType"`
-	Outcome   string    `json:"outcome"`
-	Side      string    `json:"side"`
+	ID        string `json:"id"`
+	EventID   string `json:"eventId"`
+	UserID    string `json:"userId"`
+	OrderType string `json:"orderType"`
+	Outcome   string `json:"outcome"`
+	Side      string `json:"side"`
 
 	// Quantity is the original requested quantity (whole shares).
 	Quantity int64 `json:"quantity"`
@@ -76,8 +76,8 @@ type Order struct {
 	RemainingQuantity int64 `json:"remainingQuantity"`
 
 	// Price is a fixed-point price in units of 1/10000.
-	Price  int64     `json:"price"`
-	Status string    `json:"status"`
+	Price  int64  `json:"price"`
+	Status string `json:"status"`
 
 	// LockedFunds is the amount still frozen by this order's reservation:
 	// cash for a BUY (attempted qty * limit, or full available for a market

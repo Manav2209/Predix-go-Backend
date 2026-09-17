@@ -1,10 +1,10 @@
 package middleware
 
 import (
-	"net/http"
-	"strings"
-	"predix/pkg/auth"
 	"github.com/gin-gonic/gin"
+	"net/http"
+	"predix/pkg/auth"
+	"strings"
 )
 
 func AuthMiddleware() gin.HandlerFunc {

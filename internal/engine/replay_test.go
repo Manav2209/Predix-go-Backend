@@ -26,15 +26,15 @@ func applyAll(t *testing.T, e *Engine, commands []redis.CommandEnvelope) {
 	t.Helper()
 
 	e.mu.Lock()
-	e.replaying = true
+	e.replaying[0] = true
 	e.mu.Unlock()
 
 	for _, env := range commands {
-		e.applyCommand(env)
+		e.applyCommand(0, env)
 	}
 
 	e.mu.Lock()
-	e.replaying = false
+	delete(e.replaying, 0)
 	e.mu.Unlock()
 }
 

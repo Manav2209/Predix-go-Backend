@@ -12,6 +12,7 @@ import (
 
 	"predix/internal/engine"
 	"predix/internal/events"
+	"predix/internal/partition"
 	"predix/internal/repository"
 
 	"github.com/google/uuid"
@@ -26,6 +27,11 @@ type Worker struct {
 	pool     *pgxpool.Pool
 	queries  *repository.Queries
 	consumer string
+
+	// stream/group identify the durable event stream and its consumer
+	// group. Configurable through NewWithStreams (P3.7).
+	stream string
+	group  string
 }
 
 func New(
@@ -33,11 +39,29 @@ func New(
 	pool *pgxpool.Pool,
 	queries *repository.Queries,
 ) *Worker {
+	return NewWithStreams(
+		redisClient,
+		pool,
+		queries,
+		events.EventStream,
+		events.EventGroup,
+	)
+}
+
+func NewWithStreams(
+	redisClient *redis.Client,
+	pool *pgxpool.Pool,
+	queries *repository.Queries,
+	stream string,
+	group string,
+) *Worker {
 	return &Worker{
 		redis:    redisClient,
 		pool:     pool,
 		queries:  queries,
 		consumer: uuid.NewString(),
+		stream:   stream,
+		group:    group,
 	}
 }
 
@@ -52,8 +76,8 @@ func (w *Worker) Run(ctx context.Context) error {
 	claimed, _, err := w.redis.XAutoClaim(
 		ctx,
 		&redis.XAutoClaimArgs{
-			Stream:   events.EventStream,
-			Group:    events.EventGroup,
+			Stream:   w.stream,
+			Group:    w.group,
 			Consumer: w.consumer,
 			MinIdle:  10 * time.Second,
 			Start:    "0-0",
@@ -74,9 +98,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		streams, err := w.redis.XReadGroup(
 			ctx,
 			&redis.XReadGroupArgs{
-				Group:    events.EventGroup,
+				Group:    w.group,
 				Consumer: w.consumer,
-				Streams:  []string{events.EventStream, ">"},
+				Streams:  []string{w.stream, ">"},
 				Count:    10,
 				Block:    0,
 			},
@@ -112,8 +136,8 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) ensureGroup(ctx context.Context) error {
 	err := w.redis.XGroupCreateMkStream(
 		ctx,
-		events.EventStream,
-		events.EventGroup,
+		w.stream,
+		w.group,
 		"0-0",
 	).Err()
 
@@ -148,8 +172,8 @@ func (w *Worker) processStreamEntry(
 	// Acknowledge only after the event has been durably applied.
 	return w.redis.XAck(
 		ctx,
-		events.EventStream,
-		events.EventGroup,
+		w.stream,
+		w.group,
 		entryID,
 	).Err()
 }
@@ -158,6 +182,22 @@ func (w *Worker) handleEnvelope(
 	ctx context.Context,
 	envelope events.EventEnvelope,
 ) error {
+
+	decision, err := w.fencingDecision(ctx, envelope)
+	if err != nil {
+		return fmt.Errorf("read fencing token: %w", err)
+	}
+
+	if decision == fencingStale {
+		// A stale engine (one that lost its lease and failed to notice)
+		// must not influence durable state. Drop the event and ack it so the
+		// poison record does not block the worker (P2.5).
+		log.Printf(
+			"stale event dropped event=%s type=%s partition=%d token=%d",
+			envelope.ID, envelope.Type, envelope.PartitionID, envelope.FencingToken,
+		)
+		return nil
+	}
 
 	switch envelope.Type {
 
@@ -453,11 +493,11 @@ func (w *Worker) settleTrade(
 		5. Ledger entries.
 	*/
 	if err := w.insertTransaction(ctx, qtx, repository.InsertTransactionParams{
-		UserID:  buyerID,
-		OrderID: pgtype.UUID{Bytes: takerOrderID, Valid: true},
-		TradeID: pgtype.UUID{Bytes: tradeID, Valid: true},
-		Type:    "BUY",
-		Outcome: pgtype.Text{String: trade.Outcome, Valid: true},
+		UserID:   buyerID,
+		OrderID:  pgtype.UUID{Bytes: takerOrderID, Valid: true},
+		TradeID:  pgtype.UUID{Bytes: tradeID, Valid: true},
+		Type:     "BUY",
+		Outcome:  pgtype.Text{String: trade.Outcome, Valid: true},
 		Quantity: numericFromInt(trade.Quantity),
 		Price:    numericFromScaled(trade.Price),
 		Amount:   numericFromScaled(total),
@@ -466,11 +506,11 @@ func (w *Worker) settleTrade(
 	}
 
 	if err := w.insertTransaction(ctx, qtx, repository.InsertTransactionParams{
-		UserID:  sellerID,
-		OrderID: pgtype.UUID{Bytes: makerOrderID, Valid: true},
-		TradeID: pgtype.UUID{Bytes: tradeID, Valid: true},
-		Type:    "SELL",
-		Outcome: pgtype.Text{String: trade.Outcome, Valid: true},
+		UserID:   sellerID,
+		OrderID:  pgtype.UUID{Bytes: makerOrderID, Valid: true},
+		TradeID:  pgtype.UUID{Bytes: tradeID, Valid: true},
+		Type:     "SELL",
+		Outcome:  pgtype.Text{String: trade.Outcome, Valid: true},
 		Quantity: numericFromInt(trade.Quantity),
 		Price:    numericFromScaled(trade.Price),
 		Amount:   numericFromScaled(total),
@@ -553,6 +593,51 @@ func isUniqueViolation(err error) bool {
 
 	return errors.As(err, &pgErr) &&
 		pgErr.Code == "23505"
+}
+
+type fencingDecision int
+
+const (
+	fencingAccept fencingDecision = iota
+	fencingStale
+)
+
+// fencingDecision classifies an envelope against the engine's fencing token
+// (P2.5). An envelope is stale when its token is older than the one the
+// current partition holder acquired; such writes must not reach Postgres.
+func (w *Worker) fencingDecision(
+	ctx context.Context,
+	envelope events.EventEnvelope,
+) (fencingDecision, error) {
+
+	current, err := w.redis.Get(ctx, partition.FencingKey(envelope.PartitionID)).Uint64()
+
+	if errors.Is(err, redis.Nil) {
+		// No engine has claimed the partition yet; nothing to compare against.
+		return fencingAccept, nil
+	}
+
+	if err != nil {
+		return fencingAccept, err
+	}
+
+	return fencingDecisionForToken(envelope.FencingToken, current), nil
+}
+
+// fencingDecisionForToken is the pure decision rule; kept separate so the
+// fencing behavior is unit-testable without Redis.
+func fencingDecisionForToken(token, current uint64) fencingDecision {
+	if token == 0 {
+		// Legacy envelope produced before fencing tokens existed; no fence
+		// to cross, so accept it for backward-compatible replay.
+		return fencingAccept
+	}
+
+	if token < current {
+		return fencingStale
+	}
+
+	return fencingAccept
 }
 
 // numericFromInt builds an exact DECIMAL from a whole-share integer count.

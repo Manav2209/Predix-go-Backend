@@ -67,7 +67,7 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 		Payload: payloadBytes,
 	}
 
-	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), msg)
+	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), req.EventID, msg)
 	if err != nil || !resp.Success {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "orderbook not responding", "success": false})
 		return
@@ -113,7 +113,7 @@ func (h *Handler) DeleteOrder(c *gin.Context) {
 		Payload: payloadBytes,
 	}
 
-	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), msg)
+	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), order.EventID.String(), msg)
 	if err != nil || !resp.Success {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "orderbook not responding", "success": false})
 		return

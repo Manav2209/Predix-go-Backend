@@ -256,11 +256,3 @@ func (e *Engine) GetPosition(
 
 	return pos.Available, pos.Reserved, true
 }
-
-func (e *Engine) GetPartitionID() int {
-	return e.partitionID
-}
-
-func (e *Engine) GetSequence() uint64 {
-	return e.eventSequence.Load()
-}

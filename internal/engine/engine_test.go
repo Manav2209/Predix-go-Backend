@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/json"
 	"math"
+	"sync/atomic"
 	"testing"
 )
 
@@ -12,10 +13,15 @@ func testEngine(t *testing.T) *Engine {
 	// redisManager is left nil: emitEvent no-ops, so matching exercises
 	// the book without a live Redis.
 	return &Engine{
-		markets:   make(map[string]*Market),
-		orders:    make(map[string]*Order),
-		balances:  make(map[string]*Balance),
-		positions: make(map[string]*Position),
+		markets:        make(map[string]*Market),
+		orders:         make(map[string]*Order),
+		balances:       make(map[string]*Balance),
+		positions:      make(map[string]*Position),
+		partitionSeq:   []atomic.Uint64{{}},
+		partitionToken: make(map[int]uint64),
+		partitions:     make(map[int]*partitionWorker),
+		replaying:      make(map[int]bool),
+		metrics:        NewMetrics(),
 	}
 }
 
@@ -124,7 +130,7 @@ func TestMatchOrderFillsAgainstRestingAsk(t *testing.T) {
 		Status: StatusPending,
 	}
 
-	e.matchOrder(incoming)
+	e.matchOrder(incoming, 0)
 
 	if incoming.Status != StatusFilled {
 		t.Errorf("taker status = %s, want FILLED", incoming.Status)
@@ -171,7 +177,7 @@ func TestMatchOrderPartialLeavesMakerOnBook(t *testing.T) {
 		Status: StatusPending,
 	}
 
-	e.matchOrder(incoming)
+	e.matchOrder(incoming, 0)
 
 	if incoming.Status != StatusFilled {
 		t.Errorf("taker status = %s, want FILLED", incoming.Status)
@@ -335,7 +341,7 @@ func TestFIFOMultipleRestingAsks(t *testing.T) {
 		Status: StatusPending,
 	}
 
-	e.matchOrder(incoming)
+	e.matchOrder(incoming, 0)
 
 	if incoming.Status != StatusFilled {
 		t.Errorf("taker status = %s, want FILLED", incoming.Status)
@@ -362,7 +368,7 @@ func TestMarketOrderNoLiquidity(t *testing.T) {
 		Status: StatusPending,
 	}
 
-	e.matchOrder(incoming)
+	e.matchOrder(incoming, 0)
 
 	if incoming.Status != StatusCanceled {
 		t.Errorf("market order with no liquidity: status = %s, want CANCELED", incoming.Status)

@@ -1,11 +1,11 @@
 package websocket
 
 import (
+	"encoding/json"
+	"github.com/gorilla/websocket"
 	"log"
 	"sync"
 	"time"
-	"encoding/json"
-	"github.com/gorilla/websocket"
 )
 
 const (
@@ -41,7 +41,7 @@ func NewClient(
 ) *Client {
 
 	return &Client{
-		hub: hub,
+		hub:  hub,
 		conn: conn,
 		send: make(chan []byte, sendBufferSize),
 
@@ -274,7 +274,6 @@ func (c *Client) sendError(
 
 	c.Send(data)
 }
-
 
 func (c *Client) close() {
 
