@@ -38,15 +38,17 @@ type CommandEnvelope struct {
 	CommandID string          `json:"commandId"`
 	Type      string          `json:"type"`
 	EventID   string          `json:"eventId,omitempty"`
+	RequestID string          `json:"requestId,omitempty"`
 	Sequence  uint64          `json:"sequence"`
 	Timestamp time.Time       `json:"timestamp"`
 	Payload   json.RawMessage `json:"payload"`
 }
 
 type EngineResponse struct {
-	Success bool            `json:"success"`
-	Error   string          `json:"error,omitempty"`
-	Data    json.RawMessage `json:"data,omitempty"`
+	Success   bool            `json:"success"`
+	Error     string          `json:"error,omitempty"`
+	RequestID string          `json:"requestId,omitempty"`
+	Data      json.RawMessage `json:"data,omitempty"`
 }
 
 type RedisManager struct {
@@ -128,30 +130,54 @@ func (r *RedisManager) createEnvelope(
 		seq = 0
 	}
 
+	requestID := uuid.NewString()
+
 	return CommandEnvelope{
-		CommandID: uuid.NewString(),
+		CommandID: requestID,
 		Type:      string(typ),
 		EventID:   eventID,
+		RequestID: requestID,
 		Sequence:  seq,
 		Timestamp: time.Now().UTC(),
 		Payload:   payload,
 	}
 }
 
+// RPC reliability knobs (P3.9).
+const (
+	// DefaultRPCDeadline bounds a request/response round-trip.
+	DefaultRPCDeadline = 5 * time.Second
+	// MaxAppendRetries bounds how often a durable command append is retried
+	// on a transient Redis error. Commands are idempotent, so a retried
+	// append is safe.
+	MaxAppendRetries = 3
+	// AppendRetryBackoff is the delay between append retries.
+	AppendRetryBackoff = 200 * time.Millisecond
+)
+
 // SendAndAwait writes the command to the partition of eventID and waits for
-// the owning engine's response. The command must not be lost when the caller
-// disconnects, so it is written with a detached (non-cancelable) context.
+// the owning engine's response within DefaultRPCDeadline.
 func (r *RedisManager) SendAndAwait(
 	ctx context.Context,
 	eventID string,
 	msg MessageToEngine,
 ) (*EngineResponse, error) {
+	return r.SendAndAwaitWithTimeout(ctx, eventID, msg, DefaultRPCDeadline)
+}
+
+// SendAndAwaitWithTimeout is SendAndAwait with an explicit response deadline
+// (P3.9). The command is appended with a detached (non-cancelable) context so
+// it is not lost when the caller gives up; only the reply wait observes ctx.
+// Each request carries a requestId echoed back by the engine for correlation.
+func (r *RedisManager) SendAndAwaitWithTimeout(
+	ctx context.Context,
+	eventID string,
+	msg MessageToEngine,
+	timeout time.Duration,
+) (*EngineResponse, error) {
 
 	partitionID := r.partitionFor(eventID)
 	clientID := generateClientID()
-
-	responseChan := make(chan *EngineResponse, 1)
-	errChan := make(chan error, 1)
 
 	// Detached context: the command is appended regardless; only the wait
 	// for the reply observes ctx.
@@ -169,21 +195,6 @@ func (r *RedisManager) SendAndAwait(
 		return nil, err
 	}
 
-	go func() {
-		msgChan := sub.Channel()
-		select {
-		case redisMsg := <-msgChan:
-			var resp EngineResponse
-			if err := json.Unmarshal([]byte(redisMsg.Payload), &resp); err != nil {
-				errChan <- err
-				return
-			}
-			responseChan <- &resp
-		case <-ctx.Done():
-			errChan <- ctx.Err()
-		}
-	}()
-
 	// The envelope stores the raw inner payload (never the MessageToEngine
 	// wrapper): the engine reconstructs the message from env.Type +
 	// env.Payload, so the wrapper must not leak in as payload.
@@ -194,29 +205,99 @@ func (r *RedisManager) SendAndAwait(
 		partitionID,
 	)
 
-	envBytes, err := json.Marshal(envelope)
-	if err != nil {
+	if err := r.appendCommand(bg, clientID, envelope, partitionID); err != nil {
 		return nil, err
 	}
 
-	if err := r.publisher.XAdd(bg, &redis.XAddArgs{
+	return r.awaitResponse(ctx, sub, envelope.RequestID, timeout)
+}
+
+// awaitResponse listens on the request's private channel for the engine
+// reply correlated by requestId.
+func (r *RedisManager) awaitResponse(
+	ctx context.Context,
+	sub *redis.PubSub,
+	requestID string,
+	timeout time.Duration,
+) (*EngineResponse, error) {
+
+	msgChan := sub.Channel()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case redisMsg, ok := <-msgChan:
+			if !ok {
+				return nil, errors.New("response channel closed")
+			}
+
+			var resp EngineResponse
+			if err := json.Unmarshal([]byte(redisMsg.Payload), &resp); err != nil {
+				return nil, err
+			}
+
+			// Guard against a stray or replayed response: only the reply
+			// carrying this request's id counts (P3.9 correlation).
+			if resp.RequestID != requestID {
+				continue
+			}
+
+			return &resp, nil
+
+		case <-ctx.Done():
+			return nil, ctx.Err()
+
+		case <-timer.C:
+			return nil, errors.New("timeout waiting for engine response")
+		}
+	}
+}
+
+// appendCommand writes a command envelope to its partition stream with a
+// bounded number of retries.
+func (r *RedisManager) appendCommand(
+	ctx context.Context,
+	clientID string,
+	env CommandEnvelope,
+	partitionID int,
+) error {
+
+	envBytes, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+
+	args := &redis.XAddArgs{
 		Stream: r.streamFor(partitionID),
 		Values: map[string]interface{}{
 			"clientId": clientID,
 			"command":  string(envBytes),
 		},
-	}).Err(); err != nil {
-		return nil, err
 	}
 
-	select {
-	case resp := <-responseChan:
-		return resp, nil
-	case err := <-errChan:
-		return nil, err
-	case <-time.After(5 * time.Second):
-		return nil, errors.New("timeout waiting for engine response")
+	var lastErr error
+
+	for attempt := 0; attempt < MaxAppendRetries; attempt++ {
+		if err := r.publisher.XAdd(ctx, args).Err(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(AppendRetryBackoff):
+		}
 	}
+
+	return lastErr
 }
 
 // SendCommand writes a durable command envelope to the partition of eventID

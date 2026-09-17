@@ -439,6 +439,11 @@ func (e *Engine) processStreamEntry(
 		return
 	}
 
+	// Echo the caller's requestId so the reply can be correlated (P3.9).
+	if response != nil && env.RequestID != "" {
+		response.RequestID = env.RequestID
+	}
+
 	respBytes, err := json.Marshal(response)
 	if err != nil {
 		log.Println("response marshal error:", err)
