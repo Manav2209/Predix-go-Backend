@@ -63,11 +63,23 @@ func (r *Router) SequenceKey(partitionID int) string {
 
 // FencingKey returns the durable fencing-token counter for a partition.
 func (r *Router) FencingKey(partitionID int) string {
-	return fmt.Sprintf("engine:fencing:%d", partitionID)
+	return FencingKey(partitionID)
 }
 
 // LeaseKey returns the ownership lease key for a partition (P2.3).
 func (r *Router) LeaseKey(partitionID int) string {
+	return LeaseKey(partitionID)
+}
+
+// FencingKey is the stable Redis key backing per-partition fencing tokens.
+// It doubles as the DB worker's read fence: rejects writes from a stale
+// engine token (P2.5).
+func FencingKey(partitionID int) string {
+	return fmt.Sprintf("engine:fencing:%d", partitionID)
+}
+
+// LeaseKey is the stable Redis key backing per-partition ownership (P2.3).
+func LeaseKey(partitionID int) string {
 	return fmt.Sprintf("engine:lease:%d", partitionID)
 }
 

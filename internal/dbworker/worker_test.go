@@ -102,3 +102,25 @@ func TestValidateTrade(t *testing.T) {
 		}
 	}
 }
+
+func TestFencingDecisionForToken(t *testing.T) {
+	cases := []struct {
+		name    string
+		token   uint64
+		current uint64
+		want    fencingDecision
+	}{
+		{"equal to current", 7, 7, fencingAccept},
+		{"newer than current", 8, 7, fencingAccept},
+		{"stale token", 6, 7, fencingStale},
+		{"legacy zero token bypasses fence", 0, 7, fencingAccept},
+		{"current yet to be established", 1, 0, fencingAccept},
+	}
+
+	for _, c := range cases {
+		if got := fencingDecisionForToken(c.token, c.current); got != c.want {
+			t.Errorf("%s: fencingDecisionForToken(%d, %d) = %v, want %v",
+				c.name, c.token, c.current, got, c.want)
+		}
+	}
+}

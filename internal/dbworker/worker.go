@@ -12,6 +12,7 @@ import (
 
 	"predix/internal/engine"
 	"predix/internal/events"
+	"predix/internal/partition"
 	"predix/internal/repository"
 
 	"github.com/google/uuid"
@@ -158,6 +159,22 @@ func (w *Worker) handleEnvelope(
 	ctx context.Context,
 	envelope events.EventEnvelope,
 ) error {
+
+	decision, err := w.fencingDecision(ctx, envelope)
+	if err != nil {
+		return fmt.Errorf("read fencing token: %w", err)
+	}
+
+	if decision == fencingStale {
+		// A stale engine (one that lost its lease and failed to notice)
+		// must not influence durable state. Drop the event and ack it so the
+		// poison record does not block the worker (P2.5).
+		log.Printf(
+			"stale event dropped event=%s type=%s partition=%d token=%d",
+			envelope.ID, envelope.Type, envelope.PartitionID, envelope.FencingToken,
+		)
+		return nil
+	}
 
 	switch envelope.Type {
 
@@ -553,6 +570,51 @@ func isUniqueViolation(err error) bool {
 
 	return errors.As(err, &pgErr) &&
 		pgErr.Code == "23505"
+}
+
+type fencingDecision int
+
+const (
+	fencingAccept fencingDecision = iota
+	fencingStale
+)
+
+// fencingDecision classifies an envelope against the engine's fencing token
+// (P2.5). An envelope is stale when its token is older than the one the
+// current partition holder acquired; such writes must not reach Postgres.
+func (w *Worker) fencingDecision(
+	ctx context.Context,
+	envelope events.EventEnvelope,
+) (fencingDecision, error) {
+
+	current, err := w.redis.Get(ctx, partition.FencingKey(envelope.PartitionID)).Uint64()
+
+	if errors.Is(err, redis.Nil) {
+		// No engine has claimed the partition yet; nothing to compare against.
+		return fencingAccept, nil
+	}
+
+	if err != nil {
+		return fencingAccept, err
+	}
+
+	return fencingDecisionForToken(envelope.FencingToken, current), nil
+}
+
+// fencingDecisionForToken is the pure decision rule; kept separate so the
+// fencing behavior is unit-testable without Redis.
+func fencingDecisionForToken(token, current uint64) fencingDecision {
+	if token == 0 {
+		// Legacy envelope produced before fencing tokens existed; no fence
+		// to cross, so accept it for backward-compatible replay.
+		return fencingAccept
+	}
+
+	if token < current {
+		return fencingStale
+	}
+
+	return fencingAccept
 }
 
 // numericFromInt builds an exact DECIMAL from a whole-share integer count.
