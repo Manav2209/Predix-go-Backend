@@ -9,6 +9,12 @@ type Metrics struct {
 	OrdersProcessed prometheus.Counter
 	OrderLatency    prometheus.Histogram
 
+	// AcquiredPartitions is 1 while this engine owns the partition (P2.3).
+	AcquiredPartitions *prometheus.GaugeVec
+
+	// LeaseLosses counts ownership transfers away from this instance (P2.6).
+	LeaseLosses *prometheus.CounterVec
+
 	Registry *prometheus.Registry
 }
 
@@ -27,9 +33,28 @@ func NewMetricsWithRegistry(reg *prometheus.Registry) *Metrics {
 			Help:    "Order processing latency",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1},
 		}),
+		AcquiredPartitions: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "engine_partition_owner",
+				Help: "1 while this engine holds the partition lease",
+			},
+			[]string{"engine", "partition"},
+		),
+		LeaseLosses: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "engine_lease_losses_total",
+				Help: "Partition leases lost to another engine instance",
+			},
+			[]string{"engine", "partition"},
+		),
 		Registry: reg,
 	}
 
-	reg.MustRegister(m.OrdersProcessed, m.OrderLatency)
+	reg.MustRegister(
+		m.OrdersProcessed,
+		m.OrderLatency,
+		m.AcquiredPartitions,
+		m.LeaseLosses,
+	)
 	return m
 }

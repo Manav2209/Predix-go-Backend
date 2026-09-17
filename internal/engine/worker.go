@@ -99,6 +99,11 @@ func (e *Engine) runPartition(partitionID int, _ *partitionWorker) {
 		e.partitionToken[partitionID] = token
 		e.mu.Unlock()
 
+		e.metrics.AcquiredPartitions.WithLabelValues(
+			e.engineID,
+			fmt.Sprintf("%d", partitionID),
+		).Set(1)
+
 		log.Printf(
 			"engine %s acquired partition %d (fencing token %d)",
 			e.engineID,
@@ -127,6 +132,11 @@ func (e *Engine) runPartition(partitionID int, _ *partitionWorker) {
 		e.mu.Lock()
 		delete(e.partitionToken, partitionID)
 		e.mu.Unlock()
+
+		e.metrics.AcquiredPartitions.WithLabelValues(
+			e.engineID,
+			fmt.Sprintf("%d", partitionID),
+		).Set(0)
 
 		log.Printf(
 			"engine %s released partition %d",
@@ -176,6 +186,11 @@ func (e *Engine) renewLease(
 					"lease lost for partition %d; yielding ownership",
 					partitionID,
 				)
+
+				e.metrics.LeaseLosses.WithLabelValues(
+					e.engineID,
+					fmt.Sprintf("%d", partitionID),
+				).Inc()
 
 				pcancel()
 				return

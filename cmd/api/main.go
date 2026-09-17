@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"predix/internal/handler"
+	"predix/internal/partition"
 	"predix/internal/repository"
 	"predix/internal/router"
 	"predix/pkg/redis"
@@ -31,6 +32,11 @@ func main() {
 	// Redis
     redisManager := redis.NewRedisManager(cfg.RedisURL, "")
 	defer redisManager.Close()
+
+	redisManager.SetRouter(partition.NewRouter(
+		cfg.PartitionCount,
+		cfg.CommandStreamPrefix,
+	))
 
 	queries := repository.New(conn)
 

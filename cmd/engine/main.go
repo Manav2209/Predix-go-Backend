@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"predix/internal/engine"
+	"predix/internal/partition"
 	"predix/pkg/config"
 	"predix/pkg/redis"
 )
@@ -25,6 +26,23 @@ func main() {
 	eng, err := engine.NewEngine(redisManager)
 	if err != nil {
 		log.Fatal("failed to create engine:", err)
+	}
+
+	eng.SetRouter(partition.NewRouter(
+		cfg.PartitionCount,
+		cfg.CommandStreamPrefix,
+	))
+
+	eng.SetLeaseSettings(
+		cfg.EngineID,
+		cfg.LeaseTTL,
+		cfg.LeaseRenewInterval,
+	)
+
+	for pid := 0; pid < cfg.PartitionCount; pid++ {
+		if err := eng.AddPartition(pid); err != nil {
+			log.Fatal("failed to add partition:", err)
+		}
 	}
 
 	eng.Start()
