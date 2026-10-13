@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -304,7 +305,7 @@ func (e *Engine) isReplaying(partitionID int) bool {
 	return e.replaying[partitionID]
 }
 
-// OwnedPartitions returns how many partition leases this engine currently
+// OwnedPartitions returns how many recovered partition leases this engine currently
 // holds. Used by the readiness probe (P3.5).
 func (e *Engine) OwnedPartitions() int {
 	e.mu.RLock()
@@ -552,7 +553,8 @@ func (e *Engine) handleCreateEvent(
 ) *redis.EngineResponse {
 
 	var req struct {
-		EventID string `json:"eventId"`
+		EventID   string    `json:"eventId"`
+		ExpiresAt time.Time `json:"expiresAt"`
 	}
 
 	if err := json.Unmarshal(payload, &req); err != nil {
@@ -574,6 +576,7 @@ func (e *Engine) handleCreateEvent(
 	}
 
 	e.markets[req.EventID] = NewMarket()
+	e.markets[req.EventID].ExpiresAt = req.ExpiresAt
 
 	return successJSON(map[string]any{
 		"status": "created",
@@ -700,12 +703,17 @@ func (e *Engine) handleCreateOrderCore(
 		})
 	}
 
-	if _, exists := e.markets[order.EventID]; !exists {
+	market, exists := e.markets[order.EventID]
+	if !exists {
 		e.mu.Unlock()
 
 		order.Status = StatusRejected
 
 		return failure(ErrEventNotFound.Error())
+	}
+	if !e.replaying[partitionID] && !market.ExpiresAt.IsZero() && !market.ExpiresAt.After(time.Now()) {
+		e.mu.Unlock()
+		return failure("event has expired")
 	}
 
 	if err := e.reserveOrderLocked(order); err != nil {
@@ -729,6 +737,7 @@ func (e *Engine) handleCreateOrderCore(
 	orderData, err := json.Marshal(order)
 	if err != nil {
 		e.mu.Lock()
+		e.releaseOrderLocked(order)
 		delete(e.orders, order.ID)
 		order.Status = StatusRejected
 		e.mu.Unlock()
@@ -743,6 +752,7 @@ func (e *Engine) handleCreateOrderCore(
 		false,
 	); err != nil {
 		e.mu.Lock()
+		e.releaseOrderLocked(order)
 		delete(e.orders, order.ID)
 		order.Status = StatusRejected
 		e.mu.Unlock()
@@ -781,6 +791,12 @@ func validateOrder(order *Order) error {
 
 	if order.Quantity <= 0 {
 		return errors.New("quantity must be greater than zero")
+	}
+	if order.Price < 0 || order.Price > PriceScale {
+		return errors.New("price must be between zero and one")
+	}
+	if order.Price > 0 && order.Quantity > math.MaxInt64/order.Price {
+		return errors.New("order amount exceeds supported range")
 	}
 
 	switch order.Side {
@@ -918,6 +934,18 @@ func (e *Engine) matchOrder(order *Order, partitionID int) []*Trade {
 				err,
 			)
 		}
+	}
+	// The creation event precedes trades; terminal market cancellation follows
+	// them so the DB projection ends in the same state as the matching engine.
+	if order.Status == StatusCanceled {
+		cancelData, _ := json.Marshal(map[string]any{"orderId": order.ID})
+		if err := e.emitEventP(partitionID, events.EventOrderCanceled, cancelData, false); err != nil {
+			log.Printf("failed to publish market cancellation: %v", err)
+			return trades
+		}
+	}
+	if err := e.publishDepth(partitionID, order.EventID); err != nil {
+		log.Printf("failed to publish depth: %v", err)
 	}
 
 	return trades
@@ -1277,6 +1305,10 @@ func (e *Engine) handleCancelOrderP(
 			order.ID,
 			err,
 		)
+		return failure("failed to stream cancellation")
+	}
+	if err := e.publishDepth(partitionID, order.EventID); err != nil {
+		log.Printf("failed to publish canceled depth: %v", err)
 	}
 
 	return successJSON(map[string]any{
@@ -1544,6 +1576,22 @@ func (e *Engine) publishTrade(
 		data,
 		true,
 	)
+}
+
+func (e *Engine) publishDepth(partitionID int, eventID string) error {
+	if e.redisManager == nil || e.isReplaying(partitionID) {
+		return nil
+	}
+	request, _ := json.Marshal(map[string]string{"eventId": eventID})
+	depth := e.handleGetDepth(request)
+	if !depth.Success {
+		return errors.New(depth.Error)
+	}
+	payload, err := json.Marshal(map[string]any{"eventId": eventID, "data": depth.Data})
+	if err != nil {
+		return err
+	}
+	return e.emitEventP(partitionID, events.EventDepthUpdated, payload, true)
 }
 
 // emitEvent is the partition-agnostic entry point used by tests. Live

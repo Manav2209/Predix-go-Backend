@@ -19,7 +19,10 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load("engine")
+	if err != nil {
+		log.Fatal("invalid configuration: ", err)
+	}
 
 	redisManager := redis.NewRedisManager(
 		cfg.RedisURL,
@@ -75,7 +78,7 @@ func main() {
 	defer opsCancel()
 
 	go func() {
-		if err := ops.Run(opsCtx, ":"+cfg.OpsPort); err != nil {
+		if err := ops.Run(opsCtx, cfg.OpsAddress()); err != nil {
 			log.Printf("ops server stopped: %v", err)
 		}
 	}()

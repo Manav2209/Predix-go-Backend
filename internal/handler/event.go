@@ -23,7 +23,12 @@ func (h *Handler) GetEvents(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"success": true, "data": []interface{}{}})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": events})
+	response := make([]dto.EventResponse, 0, len(events))
+	for _, event := range events {
+		item := eventResponse(repository.CreateEventRow(event))
+		response = append(response, item)
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": response})
 }
 
 func (h *Handler) GetEvent(c *gin.Context) {
@@ -38,7 +43,8 @@ func (h *Handler) GetEvent(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "event not found", "success": false})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": event})
+	response := eventResponse(repository.CreateEventRow(event))
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": response})
 }
 
 func (h *Handler) CreateEvent(c *gin.Context) {
@@ -51,6 +57,10 @@ func (h *Handler) CreateEvent(c *gin.Context) {
 	expiresAt, err := time.Parse(time.RFC3339, req.ExpiresAt)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expiresAt format, use RFC3339", "success": false})
+		return
+	}
+	if !expiresAt.After(time.Now()) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "expiresAt must be in the future", "success": false})
 		return
 	}
 
@@ -83,12 +93,17 @@ func (h *Handler) CreateEvent(c *gin.Context) {
 	}
 
 	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), event.ID.String(), msg)
-	if err != nil || !resp.Success {
+	if err != nil || resp == nil || !resp.Success {
 		// Rollback
 		h.Queries.DeleteEvent(c.Request.Context(), event.ID)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "orderbook not responding", "success": false})
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"success": true, "data": event})
+	response := eventResponse(event)
+	c.JSON(http.StatusCreated, gin.H{"success": true, "data": response})
+}
+
+func eventResponse(event repository.CreateEventRow) dto.EventResponse {
+	return dto.EventResponse{ID: event.ID.String(), Title: event.Title, Description: event.Description, Question: event.Question, Thumbnail: event.Thumbnail, IsActive: event.IsActive.Bool && event.ExpiresAt.Time.After(time.Now()), ExpiresAt: event.ExpiresAt.Time, CreatedAt: event.CreatedAt.Time, UpdatedAt: event.UpdatedAt.Time}
 }

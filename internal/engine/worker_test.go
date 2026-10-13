@@ -259,6 +259,7 @@ func TestEngineMultiPartitionIsolation(t *testing.T) {
 	partitionSeqs := map[int][]uint64{}
 
 	for _, env := range envelopes {
+		partitionSeqs[env.PartitionID] = append(partitionSeqs[env.PartitionID], env.Sequence)
 		if env.Type != events.EventOrderCreated {
 			continue
 		}
@@ -269,7 +270,6 @@ func TestEngineMultiPartitionIsolation(t *testing.T) {
 				env.PartitionID, expected, env.EventID)
 		}
 
-		partitionSeqs[env.PartitionID] = append(partitionSeqs[env.PartitionID], env.Sequence)
 	}
 
 	for p := 0; p < 2; p++ {

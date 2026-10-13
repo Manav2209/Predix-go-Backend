@@ -6,6 +6,7 @@ import (
 	"predix/internal/dto"
 	"predix/internal/engine"
 	"predix/pkg/redis"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -40,7 +41,7 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "event not found or not active", "success": false})
 		return
 	}
-	if !event.IsActive.Bool {
+	if !event.IsActive.Bool || !event.ExpiresAt.Valid || !event.ExpiresAt.Time.After(time.Now()) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "event is not active", "success": false})
 		return
 	}
@@ -68,7 +69,7 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 	}
 
 	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), req.EventID, msg)
-	if err != nil || !resp.Success {
+	if err != nil || resp == nil || !resp.Success {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "orderbook not responding", "success": false})
 		return
 	}
@@ -114,7 +115,7 @@ func (h *Handler) DeleteOrder(c *gin.Context) {
 	}
 
 	resp, err := h.RedisManager.SendAndAwait(c.Request.Context(), order.EventID.String(), msg)
-	if err != nil || !resp.Success {
+	if err != nil || resp == nil || !resp.Success {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "orderbook not responding", "success": false})
 		return
 	}

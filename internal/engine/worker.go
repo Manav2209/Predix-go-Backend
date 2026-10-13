@@ -45,6 +45,7 @@ func (e *Engine) AddPartition(partitionID int) error {
 func (e *Engine) runPartition(partitionID int, _ *partitionWorker) {
 	client := e.redisManager.GetClient()
 	fencing := partition.NewFencingTokens(client)
+	backoff := e.leaseRenewInterval
 
 	for e.ctx.Err() == nil {
 		lease := partition.NewLease(
@@ -66,18 +67,23 @@ func (e *Engine) runPartition(partitionID int, _ *partitionWorker) {
 				err,
 			)
 
-			time.Sleep(e.leaseRenewInterval)
+			if !waitPartition(e.ctx, e.leaseRenewInterval) {
+				return
+			}
 			continue
 		}
 
 		if !ok {
 			// Another engine owns this partition; wait for it to lapse.
-			time.Sleep(e.leaseRenewInterval)
+			if !waitPartition(e.ctx, e.leaseRenewInterval) {
+				return
+			}
 			continue
 		}
 
 		token, err := fencing.Next(e.ctx, e.router.FencingKey(partitionID))
 		if err != nil {
+			releaseLease(lease)
 			if e.ctx.Err() != nil {
 				return
 			}
@@ -90,24 +96,16 @@ func (e *Engine) runPartition(partitionID int, _ *partitionWorker) {
 				err,
 			)
 
-			_ = lease.Release(context.Background())
-			time.Sleep(e.leaseRenewInterval)
+			if !waitPartition(e.ctx, e.leaseRenewInterval) {
+				return
+			}
 			continue
 		}
-
-		e.mu.Lock()
-		e.partitionToken[partitionID] = token
-		e.mu.Unlock()
 
 		e.metrics.LeaseAcquire.WithLabelValues(
 			e.engineID,
 			fmt.Sprintf("%d", partitionID),
 		).Inc()
-
-		e.metrics.AcquiredPartitions.WithLabelValues(
-			e.engineID,
-			fmt.Sprintf("%d", partitionID),
-		).Set(1)
 
 		log.Printf(
 			"engine %s acquired partition %d (fencing token %d)",
@@ -125,19 +123,32 @@ func (e *Engine) runPartition(partitionID int, _ *partitionWorker) {
 		// stops reading; the outer loop then competes for the lease again.
 		pctx, pcancel := context.WithCancel(e.ctx)
 
-		go e.renewLease(pctx, pcancel, lease, partitionID)
+		renewDone := make(chan struct{})
+		go func() {
+			defer close(renewDone)
+			e.renewLease(pctx, pcancel, lease, partitionID)
+		}()
 
-		if err := e.replayCommandLog(partitionID); err != nil {
-			log.Printf("replay error partition %d: %v", partitionID, err)
+		replayErr := e.replayCommandLog(pctx, partitionID)
+		if replayErr != nil {
+			log.Printf("replay failed; partition %d is unavailable: %v", partitionID, replayErr)
+			e.logEvent("event_replay_failed", "partitionId", partitionID, "error", replayErr.Error())
+		} else if pctx.Err() == nil {
+			// Publish readiness only after recovery has completed.
+			e.mu.Lock()
+			e.partitionToken[partitionID] = token
+			e.mu.Unlock()
+			e.metrics.AcquiredPartitions.WithLabelValues(e.engineID, fmt.Sprintf("%d", partitionID)).Set(1)
+			backoff = e.leaseRenewInterval
+			e.consumeMessages(pctx, partitionID)
 		}
 
-		e.consumeMessages(pctx, partitionID)
-
 		pcancel()
+		<-renewDone
 
 		// Only release if we still own it; compare-and-release makes this
 		// safe even if another engine already took over.
-		_ = lease.Release(context.Background())
+		releaseLease(lease)
 
 		e.mu.Lock()
 		delete(e.partitionToken, partitionID)
@@ -153,6 +164,34 @@ func (e *Engine) runPartition(partitionID int, _ *partitionWorker) {
 			e.engineID,
 			partitionID,
 		)
+		if replayErr != nil {
+			if !waitPartition(e.ctx, backoff) {
+				return
+			}
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func waitPartition(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func releaseLease(lease *partition.Lease) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := lease.Release(ctx); err != nil {
+		log.Printf("lease release error: %v", err)
 	}
 }
 
@@ -181,14 +220,14 @@ func (e *Engine) renewLease(
 					return
 				}
 
-				// Transient Redis error: keep renewing. If Redis is truly
-				// down the lease eventually expires and we recover.
+				// Ownership cannot be verified, so stop replay/consumption.
 				log.Printf(
 					"lease renew error partition %d: %v",
 					partitionID,
 					err,
 				)
-				continue
+				pcancel()
+				return
 			}
 
 			if !ok {
