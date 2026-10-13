@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"predix/internal/engine"
@@ -32,6 +33,15 @@ type Worker struct {
 	// group. Configurable through NewWithStreams (P3.7).
 	stream string
 	group  string
+
+	mu            sync.RWMutex
+	running       bool
+	progress      time.Time
+	failure       error
+	claimCursor   string
+	claimInterval time.Duration
+	claimIdle     time.Duration
+	readBlock     time.Duration
 }
 
 func New(
@@ -56,45 +66,71 @@ func NewWithStreams(
 	group string,
 ) *Worker {
 	return &Worker{
-		redis:    redisClient,
-		pool:     pool,
-		queries:  queries,
-		consumer: uuid.NewString(),
-		stream:   stream,
-		group:    group,
+		redis:         redisClient,
+		pool:          pool,
+		queries:       queries,
+		consumer:      uuid.NewString(),
+		stream:        stream,
+		group:         group,
+		claimCursor:   "0-0",
+		claimInterval: 5 * time.Second,
+		claimIdle:     10 * time.Second,
+		readBlock:     500 * time.Millisecond,
 	}
 }
 
-func (w *Worker) Run(ctx context.Context) error {
+// Ready verifies that the consumer is running and making progress, including
+// successful empty reads when the stream is idle.
+func (w *Worker) Ready(context.Context) error {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.failure != nil {
+		return fmt.Errorf("consumer failed: %w", w.failure)
+	}
+	if !w.running || w.progress.IsZero() {
+		return errors.New("consumer is not running")
+	}
+	if time.Since(w.progress) > 30*time.Second {
+		return errors.New("consumer progress stalled")
+	}
+	return nil
+}
+
+func (w *Worker) markProgress() {
+	w.mu.Lock()
+	w.progress = time.Now()
+	w.mu.Unlock()
+}
+
+func (w *Worker) Run(ctx context.Context) (runErr error) {
+	w.mu.Lock()
+	w.running = true
+	w.progress = time.Time{}
+	w.failure = nil
+	w.mu.Unlock()
+	defer func() {
+		if ctx.Err() != nil {
+			runErr = nil
+		}
+		w.mu.Lock()
+		w.running = false
+		w.failure = runErr
+		w.mu.Unlock()
+	}()
 	log.Println("DB worker started")
 
 	if err := w.ensureGroup(ctx); err != nil {
 		return fmt.Errorf("ensure event group: %w", err)
 	}
 
-	// Reclaim events a crashed worker left pending in its consumer group.
-	claimed, _, err := w.redis.XAutoClaim(
-		ctx,
-		&redis.XAutoClaimArgs{
-			Stream:   w.stream,
-			Group:    w.group,
-			Consumer: w.consumer,
-			MinIdle:  10 * time.Second,
-			Start:    "0-0",
-		},
-	).Result()
-
-	if err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("XAutoClaim error: %v", err)
-	}
-
-	for _, msg := range claimed {
-		if err := w.processStreamEntry(ctx, msg.ID, msg.Values); err != nil {
-			return err
+	nextClaim := time.Time{}
+	for ctx.Err() == nil {
+		if time.Now().After(nextClaim) {
+			if err := w.reclaimPending(ctx); err != nil {
+				return fmt.Errorf("reclaim pending events: %w", err)
+			}
+			nextClaim = time.Now().Add(w.claimInterval)
 		}
-	}
-
-	for {
 		streams, err := w.redis.XReadGroup(
 			ctx,
 			&redis.XReadGroupArgs{
@@ -102,35 +138,104 @@ func (w *Worker) Run(ctx context.Context) error {
 				Consumer: w.consumer,
 				Streams:  []string{w.stream, ">"},
 				Count:    10,
-				Block:    0,
+				Block:    w.readBlock,
 			},
 		).Result()
 
 		if err != nil {
-			if errors.Is(err, context.Canceled) {
+			if ctx.Err() != nil {
 				return nil
 			}
-
-			log.Printf("XReadGroup error: %v", err)
-
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(time.Second):
+			if errors.Is(err, redis.Nil) {
+				w.markProgress()
+				continue
 			}
-
-			continue
+			return fmt.Errorf("read event stream: %w", err)
 		}
+		w.markProgress()
 
 		for _, s := range streams {
 			for _, msg := range s.Messages {
-				if err := w.processStreamEntry(ctx, msg.ID, msg.Values); err != nil {
+				if err := w.processWithRetry(ctx, msg); err != nil {
 					// Leave the entry pending so it is retried after a redelivery.
 					return fmt.Errorf("process stream entry %s: %w", msg.ID, err)
 				}
 			}
 		}
 	}
+	return nil
+}
+
+// Scan a bounded number of pages per pass so new events are not starved. The
+// cursor carries over to the next pass until Redis reports the scan complete.
+func (w *Worker) reclaimPending(ctx context.Context) error {
+	for page := 0; page < 10; page++ {
+		messages, cursor, err := w.redis.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+			Stream: w.stream, Group: w.group, Consumer: w.consumer,
+			MinIdle: w.claimIdle, Start: w.claimCursor, Count: 100,
+		}).Result()
+		if err != nil {
+			return err
+		}
+		for _, msg := range messages {
+			if err := w.processWithRetry(ctx, msg); err != nil {
+				return fmt.Errorf("entry %s: %w", msg.ID, err)
+			}
+		}
+		w.claimCursor = cursor
+		w.markProgress()
+		if cursor == "0-0" {
+			break
+		}
+	}
+	return nil
+}
+
+type invalidEvent struct{ error }
+
+func (w *Worker) processWithRetry(ctx context.Context, msg redis.XMessage) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err = w.processStreamEntry(ctx, msg.ID, msg.Values)
+		if err == nil {
+			w.markProgress()
+			return nil
+		}
+		var malformed invalidEvent
+		if errors.As(err, &malformed) {
+			return w.deadLetter(ctx, msg, err)
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(1<<attempt) * 100 * time.Millisecond):
+			}
+		}
+	}
+	return fmt.Errorf("failed after 3 attempts: %w", err)
+}
+
+// Persist the original entry before acknowledging it. A failed DLQ write
+// leaves the source pending. Operational failures are never dead-lettered.
+func (w *Worker) deadLetter(ctx context.Context, msg redis.XMessage, cause error) error {
+	raw, err := json.Marshal(msg.Values)
+	if err != nil {
+		return err
+	}
+	err = w.redis.Eval(ctx, `
+redis.call('XADD', KEYS[2], '*', 'source_stream', KEYS[1], 'source_id', ARGV[2], 'entry', ARGV[3], 'error', ARGV[4])
+return redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
+`, []string{w.stream, w.stream + ":dead-letter"}, w.group, msg.ID, string(raw), cause.Error()).Err()
+	if err != nil {
+		return fmt.Errorf("dead-letter entry %s: %w", msg.ID, err)
+	}
+	log.Printf("event dead-lettered stream=%s entry=%s reason=%v", w.stream, msg.ID, cause)
+	w.markProgress()
+	return nil
 }
 
 func (w *Worker) ensureGroup(ctx context.Context) error {
@@ -162,7 +267,10 @@ func (w *Worker) processStreamEntry(
 		[]byte(rawEvent),
 		&envelope,
 	); err != nil {
-		return fmt.Errorf("decode event envelope: %w", err)
+		return invalidEvent{fmt.Errorf("decode event envelope: %w", err)}
+	}
+	if err := validateEnvelope(envelope); err != nil {
+		return invalidEvent{err}
 	}
 
 	if err := w.handleEnvelope(ctx, envelope); err != nil {
@@ -209,10 +317,11 @@ func (w *Worker) handleEnvelope(
 
 	case events.EventOrderCanceled:
 		return w.handleOrderCanceled(ctx, envelope)
+	case events.EventOrderStatus, events.EventDepthUpdated:
+		return nil
 
 	default:
-		log.Printf("unknown event type: %s", envelope.Type)
-		return nil
+		return invalidEvent{fmt.Errorf("unknown event type: %s", envelope.Type)}
 	}
 }
 
@@ -350,6 +459,15 @@ func validateTrade(trade *engine.Trade) error {
 
 	if trade.Price < 0 {
 		return errors.New("price cannot be negative")
+	}
+	if trade.Price > engine.PriceScale {
+		return errors.New("price exceeds prediction market range")
+	}
+	if trade.TakerSide != engine.SideBuy && trade.TakerSide != engine.SideSell {
+		return errors.New("invalid taker side")
+	}
+	if trade.Price > 0 && trade.Quantity > int64(^uint64(0)>>1)/trade.Price {
+		return errors.New("trade amount overflows int64")
 	}
 
 	return nil

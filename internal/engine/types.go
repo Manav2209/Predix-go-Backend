@@ -126,8 +126,9 @@ type OrderBook struct {
 }
 
 type Market struct {
-	YES *OrderBook
-	NO  *OrderBook
+	YES       *OrderBook
+	NO        *OrderBook
+	ExpiresAt time.Time
 }
 
 func NewMarket() *Market {

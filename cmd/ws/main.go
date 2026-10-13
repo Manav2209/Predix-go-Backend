@@ -19,7 +19,10 @@ import (
 
 func main() {
 
-	cfg := config.Load()
+	cfg, err := config.Load("ws")
+	if err != nil {
+		log.Fatal("invalid configuration: ", err)
+	}
 
 	auth.Init(cfg.JWTSecret)
 
@@ -32,7 +35,8 @@ func main() {
 
 	hub := websocket.NewHub()
 
-	wsServer := websocket.NewServer(hub)
+	wsServer := websocket.NewServer(hub, cfg.WSAllowedOrigins...)
+	wsServer.AllowQueryToken = cfg.WSAllowQueryToken
 
 	wsServer.RequireAuth = true
 
@@ -69,7 +73,7 @@ func main() {
 	defer opsCancel()
 
 	go func() {
-		if err := ops.Run(opsCtx, ":"+cfg.OpsPort); err != nil {
+		if err := ops.Run(opsCtx, cfg.OpsAddress()); err != nil {
 			log.Printf("ops server stopped: %v", err)
 		}
 	}()

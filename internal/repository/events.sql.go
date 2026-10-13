@@ -73,7 +73,7 @@ func (q *Queries) DeleteEvent(ctx context.Context, id uuid.UUID) error {
 const getActiveEvents = `-- name: GetActiveEvents :many
 SELECT id, title, description, question, thumbnail, is_active, expires_at, created_at, updated_at
 FROM events
-WHERE is_active = true
+WHERE is_active = true AND expires_at > NOW()
 ORDER BY expires_at ASC
 `
 

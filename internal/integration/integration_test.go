@@ -179,15 +179,16 @@ func TestP32Integration(t *testing.T) {
 		t.Errorf("order row = (%s, %s, %s), want (BUY, YES, LIMIT)", dbSide, dbOutcome, dbType)
 	}
 
-	// ---- Scenario B: Engine → Redis → WS (order_created arrives) ----
-	var wsOrder engine.Order
-
-	if err := expectWSEvent(t, wsMsgs, events.EventOrderCreated, &wsOrder); err != nil {
+	// ---- Scenario B: Engine → Redis → WS (the updated depth arrives) ----
+	var wsDepth struct {
+		EventID string       `json:"eventId"`
+		Data    engine.Depth `json:"data"`
+	}
+	if err := expectWSEvent(t, wsMsgs, events.EventDepthUpdated, &wsDepth); err != nil {
 		t.Error(err)
 	}
-
-	if wsOrder.ID != orderID {
-		t.Errorf("ws order id = %s, want %s", wsOrder.ID, orderID)
+	if wsDepth.EventID != eventID || len(wsDepth.Data.Yes.Bids) != 1 || wsDepth.Data.Yes.Bids[0].Quantity != 10 {
+		t.Errorf("ws depth does not reflect the resting buy: %+v", wsDepth)
 	}
 
 	// ---- Settlement semantics (P3.1) via the DB worker ----
@@ -202,12 +203,16 @@ func TestP32Integration(t *testing.T) {
 	}
 
 	tradeID := uuid.NewString()
+	makerOrderID := uuid.NewString()
+	if _, err := pool.Exec(ctx, `INSERT INTO orders(id,event_id,user_id,order_type,outcome,side,quantity,price,status,filled_quantity,remaining_quantity) VALUES($1,$2,$3,'LIMIT','YES','SELL',10,0.5,'PENDING',0,10)`, makerOrderID, eventID, alice.id); err != nil {
+		t.Fatal(err)
+	}
 
 	trade := &engine.Trade{
 		ID:           tradeID,
 		EventID:      eventID,
 		OrderID:      orderID,
-		MatchOrderID: orderID,
+		MatchOrderID: makerOrderID,
 		BuyerID:      bob.id,
 		SellerID:     alice.id,
 		Outcome:      engine.OutcomeYes,
@@ -226,6 +231,13 @@ func TestP32Integration(t *testing.T) {
 		return n == 1
 	}, "db worker settles the trade")
 
+	// This trade is injected as a DB settlement fixture. Publish its separate
+	// notification explicitly; the DB worker is not a WebSocket publisher.
+	tradeData, _ := json.Marshal(trade)
+	notification, _ := json.Marshal(events.NewEnvelope(events.NewEnvelopeParams{Type: events.EventTradeExecuted, Data: tradeData}))
+	if err := client.Publish(ctx, itestWS, string(notification)).Err(); err != nil {
+		t.Fatal(err)
+	}
 	if wsErr := expectWSEvent(t, wsMsgs, events.EventTradeExecuted, nil); wsErr != nil {
 		t.Error(wsErr)
 	}
@@ -277,7 +289,11 @@ func TestP32Integration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(2 * time.Second)
+	waitFor(t, 10*time.Second, func() bool {
+		pending, err := client.XPending(ctx, itestStream, itestGroup).Result()
+		groups, groupErr := client.XInfoGroups(ctx, itestStream).Result()
+		return err == nil && groupErr == nil && pending.Count == 0 && len(groups) == 1 && groups[0].Lag == 0
+	}, "duplicate trade is acknowledged")
 
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM trades`).Scan(&txCount); err != nil {
 		t.Fatal(err)

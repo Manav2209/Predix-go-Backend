@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -15,10 +17,21 @@ import (
 	"predix/pkg/redis"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func main() {
-	cfg := config.Load()
+	if err := run(); err != nil {
+		log.Printf("DB worker failed: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load("db-worker")
+	if err != nil {
+		return err
+	}
 
 	ctx := context.Background()
 
@@ -27,7 +40,7 @@ func main() {
 		cfg.DatabaseURL,
 	)
 	if err != nil {
-		log.Fatal("database connection failed:", err)
+		return fmt.Errorf("database connection failed: %w", err)
 	}
 
 	defer db.Close()
@@ -51,6 +64,9 @@ func main() {
 
 	// P3.4/P3.5: metrics + health for the DB worker process.
 	ops := observability.NewOps(nil)
+	ops.AddCheck("consumer", worker.Ready)
+	failures := prometheus.NewCounter(prometheus.CounterOpts{Name: "db_worker_failures_total", Help: "Unexpected DB consumer terminations."})
+	ops.Registry().MustRegister(failures)
 
 	ops.AddCheck("redis", func(ctx context.Context) error {
 		return redisManager.GetClient().Ping(ctx).Err()
@@ -64,7 +80,7 @@ func main() {
 	defer opsCancel()
 
 	go func() {
-		if err := ops.Run(opsCtx, ":"+cfg.OpsPort); err != nil {
+		if err := ops.Run(opsCtx, cfg.OpsAddress()); err != nil {
 			log.Printf("ops server stopped: %v", err)
 		}
 	}()
@@ -87,21 +103,30 @@ func main() {
 		syscall.SIGINT,
 		syscall.SIGTERM,
 	)
+	defer signal.Stop(signalChan)
 
-	<-signalChan
+	err = waitForWorker(signalChan, workerDone, workerCancel, 10*time.Second)
+	if err != nil {
+		failures.Inc()
+	}
+	return err
+}
 
-	log.Println("shutting down DB worker")
-
-	opsCancel()
-	workerCancel()
-
-	// Bound the worker drain so shutdown always completes (P3.6).
+func waitForWorker(signals <-chan os.Signal, done <-chan error, cancel context.CancelFunc, timeout time.Duration) error {
 	select {
-	case err := <-workerDone:
-		if err != nil {
-			log.Printf("DB worker stopped with error: %v", err)
+	case err := <-done:
+		if err == nil {
+			err = errors.New("consumer stopped unexpectedly")
 		}
-	case <-time.After(10 * time.Second):
-		log.Println("DB worker drain timed out")
+		return err
+	case <-signals:
+		log.Println("shutting down DB worker")
+		cancel()
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return errors.New("DB worker drain timed out")
 	}
 }

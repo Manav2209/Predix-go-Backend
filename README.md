@@ -99,7 +99,7 @@ internal/
   middleware/        # JWT middleware
   websocket/         # Hub, clients, Redis subscriber
   observability/     # Health checks and Prometheus metrics
-  repository/        # sqlc-generated database access
+  repository/        # sqlc-generated and custom database queries
   dto/               # API request/response types
   integration/       # Integration tests
   events/            # Event definitions
@@ -113,6 +113,9 @@ db/
   queries/           # SQL source queries for sqlc
 spec/                # Reliability/distributed-engine design spec
 sqlc.yaml            # sqlc configuration
+scripts/
+  migrate/           # Check/apply the existing-schema lifecycle migration
+  smoke/             # Live API, WebSocket, persistence, and recovery checks
 ```
 
 ## Getting started
@@ -120,9 +123,10 @@ sqlc.yaml            # sqlc configuration
 ### Prerequisites
 
 - Go **1.25.3** (as specified in `go.mod`)
-- PostgreSQL
-- Redis
-- A SQL migration runner or `psql` to apply the migration SQL
+- An existing PostgreSQL database and its connection string
+- Redis 6.2+ (`XAUTOCLAIM` support); Redis 7 for the deployment lab
+- Docker for integration tests and the optional disposable smoke-test database
+- `psql` for initializing a fresh database from the SQL migrations
 
 ### 1. Clone and install dependencies
 
@@ -132,53 +136,68 @@ cd Predix-go-Backend
 go mod download
 ```
 
-### 2. Start PostgreSQL and Redis
+### 2. Use the existing PostgreSQL and Redis services
 
-For a quick local setup using Docker:
+Keep PostgreSQL running as it is and supply its current connection string through
+`DATABASE_URL`. The local and AWS deployment lab uses this existing database;
+it does not require a new PostgreSQL container, RDS instance, or database EBS volume.
+Preserve the connection's required TLS options.
+
+Reuse Redis if it is already running. For a fresh local Redis instance, the
+following example enables AOF and a persistent volume with a loopback-only port:
 
 ```bash
-docker run -d --name predix-postgres \
-  -e POSTGRES_USER=postgres \
-  -e POSTGRES_PASSWORD=mysecretpassword \
-  -e POSTGRES_DB=predix \
-  -p 5432:5432 postgres:16
-
-docker run -d --name predix-redis -p 6379:6379 redis:7
+docker run -d --name predix-redis \
+  -p 127.0.0.1:6379:6379 -v predix-redis-data:/data \
+  redis:7-alpine redis-server --appendonly yes
 ```
 
-These are **development-only** credentials and exposed ports.
+### 3. Configure environment
 
-### 3. Apply database schema
+Local service startup automatically loads `.env` from the working directory.
+Explicit environment variables take precedence. The `.env` file is ignored by Git.
 
-From the project root, apply the `*.up.sql` files in numerical order:
+```dotenv
+DATABASE_URL=<your-existing-postgresql-connection-string>
+REDIS_URL=localhost:6379
+JWT_SECRET=<your-random-secret-of-at-least-32-bytes>
+API_PORT=3000
+WS_PORT=8080
+PARTITION_COUNT=1
+```
+
+Generate a random secret with `openssl rand -hex 32` and save it in `.env`.
+Use the **same** JWT secret, Redis settings, stream names, and partition count
+across the relevant services. `ENGINE_ID` defaults to a generated UUID; if
+overridden, it must identify a unique engine instance.
+
+### 4. Check or apply database schema
+
+For an existing database with migrations 001–003, the dedicated command checks
+migration 004 by default and applies it only with the explicit flag:
+
+```bash
+go run ./scripts/migrate
+go run ./scripts/migrate -apply
+```
+
+Migration 004 runs atomically through this command, backfills fills, remaining
+quantity and event volume, and verifies existing row counts before committing.
+If the required lifecycle columns already exist, the command reports success
+without reapplying the migration.
+
+For a **fresh** database, export the same `DATABASE_URL` configured in `.env`
+and apply the `*.up.sql` files in numerical order:
 
 ```bash
 for migration in db/migrations/*.up.sql; do
-  psql "postgres://postgres:mysecretpassword@localhost:5432/predix?sslmode=disable" \
-    -v ON_ERROR_STOP=1 -f "$migration" || exit 1
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration" || exit 1
 done
 ```
 
-The repository contains SQL migration files, but no checked-in migration CLI configuration. Note that some rollback filenames do not follow the same naming convention as the `*.up.sql` files; review them before configuring an automated migration tool.
-
-### 4. Configure environment
-
-The application reads **environment variables**, not an `.env` file automatically. Export the following variables or load them using your preferred shell tooling:
-
-```bash
-export DATABASE_URL='postgres://postgres:mysecretpassword@localhost:5432/predix?sslmode=disable'
-export REDIS_URL='localhost:6379'
-export JWT_SECRET='replace-with-a-long-random-secret'
-
-export API_PORT=3000
-export WS_PORT=8080
-export OPS_PORT=9090
-
-export PARTITION_COUNT=1
-export ENGINE_ID=engine-0
-```
-
-Use the **same** `JWT_SECRET`, Redis configuration, stream names, and partition count across relevant services.
+Some rollback filenames use different naming conventions; review them before
+configuring an automated migration tool. Do not rerun the initial migrations
+against an already initialized database.
 
 ### 5. Run all four services
 
@@ -186,19 +205,21 @@ Open four terminals in the repository root (with the environment variables loade
 
 ```bash
 # Terminal 1 — HTTP API
-go run ./cmd/api
+OPS_PORT=9090 go run ./cmd/api
 
 # Terminal 2 — Matching engine
-go run ./cmd/engine
+OPS_PORT=9091 go run ./cmd/engine
 
 # Terminal 3 — Database worker
-OPS_PORT=9091 go run ./cmd/db-worker
+OPS_PORT=9092 go run ./cmd/db-worker
 
 # Terminal 4 — WebSocket gateway
-OPS_PORT=9092 go run ./cmd/ws
+OPS_PORT=9093 go run ./cmd/ws
 ```
 
-**Important:** The API serves metrics and health checks on its API port. Engine, worker, and WebSocket processes run separate operations servers, so each needs its **own `OPS_PORT`** when running on the same machine. The example uses `9090` for the engine, `9091` for the DB worker, and `9092` for WebSockets.
+All four services use a separate operations listener. The example uses ops ports
+`9090` for API, `9091` for engine, `9092` for DB worker, and `9093` for WebSockets.
+On PowerShell, set `$env:OPS_PORT` to the corresponding value before `go run`.
 
 Test the API:
 
@@ -206,27 +227,30 @@ Test the API:
 curl http://localhost:3000/ping
 # pong
 
-curl http://localhost:3000/health/ready
+curl http://localhost:9090/health/ready
 ```
 
 ## Configuration
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `DATABASE_URL` | Local PostgreSQL URL | Database connection string |
-| `REDIS_URL` | `localhost:6379` | Redis connection |
-| `JWT_SECRET` | *(empty)* | Secret for signing/verifying tokens; **set explicitly** |
-| `API_PORT` | `3000` | HTTP API port (`PORT` is a fallback) |
-| `WS_PORT` | `8080` | WebSocket gateway port |
-| `OPS_PORT` | `9090` | Non-API health/metrics port |
-| `DB_STREAM` | `events:out` | Persistence event stream |
-| `DB_GROUP` | `db-workers` | Database-worker consumer group |
-| `WS_STREAM` | `ws:updates` | Live-update Redis channel |
-| `ENGINE_ID` | `engine-0` | Identifier for engine lease ownership |
-| `PARTITION_COUNT` | `1` | Number of event partitions |
-| `COMMAND_STREAM_PREFIX` | `commands` | Prefix for partition command streams |
-| `LEASE_TTL` | `15s` | Partition lease duration |
-| `LEASE_RENEW_INTERVAL` | `5s` | Lease renewal cadence |
+| Variable              | Default                          | Description                            |
+|-----------------------|----------------------------------|----------------------------------------|
+| `API_PORT`            | `PORT` \|\| `3000`               | REST API port                          |
+| `WS_PORT`             | `8080`                           | WebSocket port                         |
+| `OPS_PORT`            | `9090`                           | metrics/health port                    |
+| `OPS_HOST`            | `127.0.0.1`                      | private metrics/health bind address    |
+| `DATABASE_URL`        | *(required for api/db-worker)*   | explicit Postgres DSN; no credentials fallback |
+| `REDIS_URL`           | *(required)*                     | Redis host:port address                |
+| `JWT_SECRET`          | *(required for api/ws)*          | random HS256 secret, at least 32 bytes |
+| `WS_ALLOWED_ORIGINS`  | *(same origin only)*             | comma-separated exact browser origins |
+| `WS_ALLOW_QUERY_TOKEN`| `false`                          | opt in to legacy URL tokens           |
+| `ENGINE_ID`           | generated UUID                   | unique engine instance id (lease owner)|
+| `PARTITION_COUNT`     | `1`                              | number of engine partitions            |
+| `LEASE_TTL`           | `15s`                            | partition lease duration               |
+| `LEASE_RENEW_INTERVAL`| `5s`                             | lease renew cadence                    |
+| `COMMAND_STREAM_PREFIX` | `commands`                     | prefix for `commands:{p}` streams      |
+| `DB_STREAM`           | `events:out`                     | event stream consumed by DB worker     |
+| `DB_GROUP`            | `db-workers`                     | DB worker consumer group               |
+| `WS_STREAM`           | `ws:updates`                     | WS fan-out channel                     |
 
 ## HTTP API
 
@@ -247,9 +271,20 @@ The base URL is `http://localhost:3000`. Unless explicitly stated, endpoints req
 | `GET` | `/orderbook/:eventId` | Get order-book depth | JWT |
 | `GET` | `/orderbook/:eventId/depth` | Get order-book depth | JWT |
 | `GET` | `/ping` | Basic ping | Public |
-| `GET` | `/health/live` | Liveness | Public |
-| `GET` | `/health/ready` | Dependency readiness | Public |
-| `GET` | `/metrics` | Prometheus metrics | Public |
+| `GET` | `/` | Basic service greeting | Public |
+
+Health and metrics endpoints use the separate operations ports described above.
+They are not public API routes.
+
+`/balances` returns the authenticated user's settled cash as
+`data: {userId, balance}`. `/position` returns an array of that user's positions
+with `eventId`, `outcome`, `shares`, `avgPrice`, and `updatedAt`. These read the
+durable PostgreSQL projection and may briefly lag command processing. The
+balance is settled cash, not the engine's available/reserved split.
+
+Event responses consistently use `id`, `isActive`, and `expiresAt`. Expired
+events are excluded from `/events`, and cannot accept new orders. Event creation
+requires an `expiresAt` value in the future.
 
 ### Sign up / sign in
 
@@ -302,7 +337,11 @@ curl -X POST http://localhost:3000/order \
   }'
 ```
 
-`orderType`: `LIMIT` or `MARKET`; `outcome`: `YES` or `NO`; `side`: `BUY` or `SELL`. The `price` field is required for limit orders. Order responses expose the resulting engine data; internal prices use four-decimal fixed-point units.
+`orderType`: `LIMIT` or `MARKET`; `outcome`: `YES` or `NO`; `side`: `BUY` or `SELL`.
+Limit prices must be greater than zero and no higher than `1.0`. Optional
+`orderId` values must be UUIDs; the API generates one when omitted. Order
+responses expose the resulting engine state; internal prices use fixed-point
+integers in units of `1/10000`.
 
 ### View depth and cancel
 
@@ -316,11 +355,23 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 
 ## Real-time WebSocket updates
 
-The WebSocket gateway listens at `ws://localhost:8080/ws` and requires a JWT in the `token` query parameter:
+The WebSocket gateway listens at `ws://localhost:8080/ws`. Native clients send
+`Authorization: Bearer <JWT>`; browser clients authenticate through the
+`bearer` subprotocol:
 
-```text
-ws://localhost:8080/ws?token=<JWT>
+```javascript
+const socket = new WebSocket("ws://localhost:8080/ws", ["bearer", jwt]);
 ```
+
+The server negotiates only `bearer`, never echoing the token. Set
+`WS_ALLOWED_ORIGINS` to exact, comma-separated browser origins when the frontend
+origin differs from the gateway. With no allowlist, browser connections must be
+same-origin. Origin-free native clients still require authentication. Use `wss://`
+for exposed connections.
+
+Query-string JWTs are disabled by default. Legacy clients require explicit
+`WS_ALLOW_QUERY_TOKEN=true`; application requests have `token` removed from their
+URL, but upstream proxies must also redact URL credentials from access logs.
 
 Subscribe to one or more event IDs:
 
@@ -334,7 +385,10 @@ Unsubscribe:
 {"method":"UNSUBSCRIBE","params":["<event-uuid>"]}
 ```
 
-The gateway forwards market updates to subscribed clients and implements heartbeat ping/pong handling. Be aware that query-string tokens can be captured in logs and that the current WebSocket upgrader accepts all origins; this needs tightening before public deployment.
+The gateway delivers `depth` messages with YES/NO books and `trade` messages with
+trade details to subscribed clients. It also implements heartbeat ping/pong
+handling. Engine book changes, including cancellations, publish depth updates;
+Redis event envelopes are the internal transport rather than the browser wire format.
 
 ## Matching and reliability model
 
@@ -352,35 +406,93 @@ Events map to command-stream partitions. The engine uses partition leases and fe
 
 These mechanisms are the focus of the project; do not assume they have been certified for financial production use or subjected to published performance benchmarks.
 
+## Reliability notes
+
+- **Lease/fencing**: partition ownership is a Redis lease; acquiring it bumps
+  a fencing token stamped on every event. Stale writers are dropped by the
+  DB worker.
+- **RPC**: `SendAndAwait` correlates replies by `requestId`, has a bounded
+  deadline, and retries durable appends; timeouts do not leak goroutines or
+  lose commands.
+- **Shutdown**: every service drains in-flight work with a deadline.
+- **DB consumer recovery**: pending events are reclaimed every five seconds
+  once idle for ten seconds, scanning up to ten pages of 100 entries per pass.
+  The scan cursor carries over between passes. Operational processing failures
+  receive three attempts with backoff, then stop the process with a nonzero
+  exit while leaving the event pending. Readiness fails before startup, after
+  termination, or after 30 seconds without consumer progress; idle successful
+  reads count as progress.
+- **Dead letters**: malformed envelopes/payloads are preserved in
+  `<DB_STREAM>:dead-letter` with their source stream/id, original entry, and
+  error before the source is acknowledged. Monitor this stream and repair and
+  requeue entries after investigating them. Database/Redis failures are not
+  dead-lettered. A failed dead-letter write leaves the source pending.
+- **Replay recovery**: a partition cannot consume or advertise recovered
+  ownership until replay succeeds. Corrupt envelopes, unsupported commands,
+  and unreadable payloads fail recovery. The engine releases the lease and
+  retries with exponential backoff capped at 30 seconds; repair corrupt log
+  entries before the partition can recover. Valid business rejections in the
+  command log are reproduced by the command handlers.
+- **Metrics**: `engine_orders_accepted_total`, `engine_trades_executed_total`,
+  `engine_settlement_failures_total`, `engine_redis_latency_seconds`,
+  `engine_matching_latency_seconds`, `engine_replay_latency_seconds`,
+  `engine_partition_owner`, `engine_lease_losses_total`, and more.
+- **Logging**: JSON structured logs carrying `requestId`, `commandId`,
+  `orderId`, `eventId`, `partitionId`, `sequence`, and `instanceId`.
+- Prices are fixed-point integers (`1/10000`); balances/shares are int64.
+
 ## Observability
 
-- `/health/live`: process liveness.
-- `/health/ready`: readiness checks against Redis, PostgreSQL, and/or owned engine partitions, depending on the process.
-- `/metrics`: Prometheus-compatible process/runtime metrics, plus matching-engine metrics on the engine process.
+Every service exposes `/health/live`, `/health/ready`, and `/metrics` through a
+separate `OPS_HOST:OPS_PORT` listener. The default bind address is
+`127.0.0.1:9090`; operational endpoints are not mounted on the public API port.
+Use a different ops port for each service when running them on one machine.
 
-The API exposes these on `API_PORT`; the engine, DB worker, and WebSocket process expose them on their respective `OPS_PORT`.
+Readiness checks Redis and, where applicable, PostgreSQL. The engine also
+requires recovered partition ownership; the DB worker checks consumer progress.
+For Kubernetes HTTP probes, set `OPS_HOST=0.0.0.0` and restrict the ops port to
+probes and monitoring through network policy. Keep it out of public ingress.
 
-## Running tests
+Prometheus exposes process/runtime metrics on all services and matching-engine
+metrics on the engine process. Engine logs include request, command, order,
+event, partition, and instance identifiers where applicable.
+
+## Tests
 
 ```bash
-# Unit and package tests
 go test ./...
 
-# Verbose tests
-go test -v ./internal/engine ./internal/partition
+# Engine stress (repeat run to surface flakes)
+go test ./internal/engine -count=2
+
+# Integration tests (need Docker) — full API→Redis→Engine→DB Worker→Postgres
+# flow plus Engine→Redis→WS; skips automatically when Docker is unavailable.
+go test ./internal/integration -v
+
+# Live HTTP + WebSocket smoke test of all four service binaries.
+# Uses the configured Redis, disposable local PostgreSQL, isolated test data,
+# and a generated JWT secret. Stops test services and removes test data afterward.
+# Requires Docker, and no other engine holding Redis partition 0.
+mkdir -p tmp/smoke/bin
+go build -o tmp/smoke/bin/ ./cmd/api ./cmd/engine ./cmd/db-worker ./cmd/ws
+go run ./scripts/smoke
+
+# Read-only connectivity check against .env dependencies:
+go run ./scripts/smoke -probe
 ```
 
-Integration tests use Testcontainers and may require a running Docker daemon. To regenerate SQL query code after changing SQL sources, install `sqlc` and run:
-
-```bash
-sqlc generate
-```
+The disposable PostgreSQL container is a test fixture; normal application
+startup continues to use the existing `DATABASE_URL`. For query-source changes,
+regenerate generated database access code with `sqlc generate`.
 
 ## Known development limitations
 
 - No bundled Compose/Kubernetes deployment configuration or frontend.
-- `JWT_SECRET` must be supplied; don't deploy with an empty secret.
-- The WebSocket origin check currently permits all origins and JWTs are passed in URL query strings.
+- `JWT_SECRET` must be explicitly supplied and contain at least 32 bytes.
+- Redis TLS and authentication configuration must be added before the planned managed-Redis deployment.
+- There is no public share-issuance API to bootstrap a successful SELL from a new
+  account. Current settlement tests use isolated fixtures; genuine matching load
+  tests need a controlled way to seed holdings.
 - User creation provides simulated starting funds for development.
 - Replay currently scans the command history; snapshotting/compaction may be useful as history grows.
 - This is not a production-ready real-money trading or settlement system.

@@ -26,7 +26,10 @@ import (
 func main() {
 
 	// Load config
-	cfg := config.Load()
+	cfg, err := config.Load("api")
+	if err != nil {
+		log.Fatal("invalid configuration: ", err)
+	}
 
 	auth.Init(cfg.JWTSecret)
 
@@ -70,9 +73,13 @@ func main() {
 	// Routes
 	router.SetupRoutes(r, h)
 
-	r.GET("/health/live", gin.WrapF(observability.LiveHandler()))
-	r.GET("/health/ready", gin.WrapF(ops.ReadyHandler()))
-	r.GET("/metrics", gin.WrapH(ops.MetricsHandler()))
+	opsCtx, opsCancel := context.WithCancel(ctx)
+	defer opsCancel()
+	go func() {
+		if err := ops.Run(opsCtx, cfg.OpsAddress()); err != nil {
+			log.Printf("ops server stopped: %v", err)
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.APIPort,
